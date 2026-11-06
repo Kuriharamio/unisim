@@ -158,6 +158,10 @@ __all__ = [
     "TensorIOSpec",
     "TensorLifecycleCapabilities",
     "TensorProcessTopology",
+    "TensorFrameRead",
+    "TensorReadPlan",
+    "TensorSiteJacobianViews",
+    "TensorSitePoseViews",
     "TensorResetRandomizationPayload",
     "TensorRuntimeDiagnostic",
     "TerrainHeightSampleFn",
@@ -286,6 +290,11 @@ class TensorLifecycleCapabilities:
     # ``set_state_tensor_mask`` semantics and authoritative selected-row views.
     mask_selected_reset: bool = False
     mask_selected_reset_full_refresh: bool = False
+    frame_read_plan: bool = False
+    site_pose_views: bool = False
+    site_jacobian_views: bool = False
+    site_state_kinematics: bool = False
+    deferred_finite_validation: bool = False
 
     def __post_init__(self) -> None:
         if self.execution is TensorExecution.UNSUPPORTED:
@@ -311,6 +320,11 @@ class TensorLifecycleCapabilities:
                     self.tracked_body_views,
                     self.mask_selected_reset,
                     self.mask_selected_reset_full_refresh,
+                    self.frame_read_plan,
+                    self.site_pose_views,
+                    self.site_jacobian_views,
+                    self.site_state_kinematics,
+                    self.deferred_finite_validation,
                 )
             ):
                 raise ValueError("unsupported tensor lifecycle must remain fail closed")
@@ -365,6 +379,8 @@ class TensorLifecycleCapabilities:
             raise ValueError("tensor state views require at least one declared state field")
         if self.generalized_force_injection and not self.stepping:
             raise ValueError("tensor generalized-force injection requires tensor stepping")
+        if self.deferred_finite_validation and not self.stepping:
+            raise ValueError("deferred finite validation requires tensor stepping")
         if self.actuator_gain_scaling and not self.stepping:
             raise ValueError("tensor actuator-gain scaling requires tensor stepping")
         if self.selected_reset_publication is not None and not self.selected_reset:
@@ -403,6 +419,19 @@ class TensorLifecycleCapabilities:
             )
         if self.mask_selected_reset_full_refresh and not self.mask_selected_reset:
             raise ValueError("mask-selected full refresh requires mask-selected reset")
+        if self.frame_read_plan and not self.state_views:
+            raise ValueError("frame read plans require state views")
+        if self.site_jacobian_views and not self.site_pose_views:
+            raise ValueError("site Jacobian views require site pose views")
+        if self.site_state_kinematics and not (
+            self.execution is TensorExecution.DEVICE_RESIDENT
+            and self.site_pose_views
+            and self.site_jacobian_views
+        ):
+            raise ValueError(
+                "state-conditioned site kinematics require device-resident site pose "
+                "and Jacobian views"
+            )
         if self.packed_reset_mocap and not self.packed_reset:
             raise ValueError("packed reset mocap requires packed reset")
         if self.packed_reset and not self.device_reset_randomization:
@@ -594,6 +623,115 @@ class TrackedBodyStateViews:
 
 
 @dataclass(frozen=True)
+class TensorSitePoseViews:
+    """Ordered, backend-owned world poses for named sites.
+
+    ``pos_w`` has shape ``(num_envs, num_sites, 3)`` and ``quat_w`` has
+    shape ``(num_envs, num_sites, 4)`` in wxyz order. Device-resident views
+    alias stable backend storage or backend-owned derived buffers and are valid
+    until the next physics step or reset. They are read-only by contract.
+    """
+
+    site_names: tuple[str, ...]
+    pos_w: Any
+    quat_w: Any
+
+
+@dataclass(frozen=True)
+class TensorSiteJacobianViews:
+    """World-frame site Jacobians in the requested generalized coordinate order.
+
+    ``jacp`` and ``jacr`` each have shape ``(num_envs, 3, num_dofs)``. The
+    selected ``dof_indices`` are immutable metadata aligned with the final
+    axis; callers do not receive native model/data handles.
+    """
+
+    site_name: str
+    dof_indices: tuple[int, ...]
+    jacp: Any
+    jacr: Any
+
+
+@dataclass(frozen=True)
+class TensorSiteKinematicsViews:
+    """Device kinematics evaluated for caller-supplied selected qpos rows.
+
+    The returned world-space position, wxyz quaternion and Jacobian tensors
+    have a leading dimension aligned with ``env_indices``. They are owned by
+    the backend and remain valid until the next state-conditioned kinematics
+    call. Input state and outputs stay on the declared device. Implementations
+    must order caller-stream writes before kinematics and make outputs visible
+    on the caller's stream before returning.
+    """
+
+    site_name: str
+    env_indices: Any
+    dof_indices: tuple[int, ...]
+    pos_w: Any
+    quat_w: Any
+    jacp: Any
+    jacr: Any
+
+
+@dataclass(frozen=True)
+class TensorFrameRead:
+    """One frame's requested live tensor views grouped by public field name."""
+
+    state: Mapping[str, Any]
+    sensors: Mapping[str, Any]
+    bodies: TrackedBodyStateViews | None = None
+    sites: Mapping[str, TensorSitePoseViews] | None = None
+    jacobians: Mapping[str, TensorSiteJacobianViews] | None = None
+
+
+class TensorReadPlan:
+    """Cold-bound frame read request; each ``read`` returns current live views.
+
+    A plan owns only static names/layout. The backend declares whether reads
+    alias device storage and which stream orders them through
+    ``TensorLifecycleCapabilities.stream_event_ownership``.
+    """
+
+    def __init__(self, backend: Any, spec: "TensorIOSpec") -> None:
+        self._backend = backend
+        self.spec = spec
+
+    def read(self) -> TensorFrameRead:
+        backend = self._backend
+        state = (
+            backend.get_state_views(self.spec.state_fields, device=self.spec.device)
+            if self.spec.state_fields
+            else {}
+        )
+        sensors = (
+            backend.get_sensor_views(self.spec.sensor_names, device=self.spec.device)
+            if self.spec.sensor_names
+            else {}
+        )
+        bodies = None
+        if self.spec.body_names:
+            bodies = backend.get_tracked_body_views(self.spec.body_names, device=self.spec.device)
+        sites = {}
+        if self.spec.site_names:
+            pose_views = backend.get_site_pose_tensor(self.spec.site_names, device=self.spec.device)
+            sites = {
+                name: TensorSitePoseViews(
+                    (name,),
+                    pose_views.pos_w[:, index : index + 1],
+                    pose_views.quat_w[:, index : index + 1],
+                )
+                for index, name in enumerate(pose_views.site_names)
+            }
+        jacobians = {
+            name: backend.get_site_jacobian_tensor(name, device=self.spec.device)
+            for name in self.spec.jacobian_site_names
+        }
+        return TensorFrameRead(
+            state=state, sensors=sensors, bodies=bodies, sites=sites, jacobians=jacobians
+        )
+
+
+@dataclass(frozen=True)
 class TensorIOSpec:
     """Cold-path request for one persistent host-bridge I/O layout.
 
@@ -605,11 +743,24 @@ class TensorIOSpec:
     sensor_names: tuple[str, ...] = ()
     body_names: tuple[str, ...] = ()
     body_fields: tuple[str, ...] = ()
+    site_names: tuple[str, ...] = ()
+    jacobian_site_names: tuple[str, ...] = ()
     device: Any | None = None
 
     def __post_init__(self) -> None:
-        if not self.state_fields and not self.sensor_names and not self.body_names:
-            raise ValueError("tensor I/O request must contain state fields, sensors, or bodies")
+        if not any(
+            (
+                self.state_fields,
+                self.sensor_names,
+                self.body_names,
+                self.site_names,
+                self.jacobian_site_names,
+            )
+        ):
+            raise ValueError(
+                "tensor I/O request must contain state fields, sensors, bodies, sites, "
+                "or Jacobians"
+            )
         if len(set(self.state_fields)) != len(self.state_fields):
             raise ValueError("tensor I/O state fields must be unique")
         if len(set(self.sensor_names)) != len(self.sensor_names):
@@ -618,6 +769,16 @@ class TensorIOSpec:
         object.__setattr__(self, "sensor_names", tuple(self.sensor_names))
         object.__setattr__(self, "body_names", tuple(self.body_names))
         object.__setattr__(self, "body_fields", tuple(self.body_fields))
+        object.__setattr__(self, "site_names", tuple(self.site_names))
+        object.__setattr__(self, "jacobian_site_names", tuple(self.jacobian_site_names))
+        for label, names in (
+            ("site_names", self.site_names),
+            ("jacobian_site_names", self.jacobian_site_names),
+        ):
+            if any(not isinstance(name, str) or not name for name in names):
+                raise TypeError(f"tensor I/O {label} must contain non-empty names")
+            if len(set(names)) != len(names):
+                raise ValueError(f"tensor I/O {label} must be unique")
         if self.body_names:
             if any(not isinstance(name, str) or not name for name in self.body_names):
                 raise TypeError("tensor I/O body names must be non-empty strings")
@@ -627,7 +788,7 @@ class TensorIOSpec:
                 raise ValueError("tensor I/O body request must name at least one body field")
             if any(not isinstance(field, str) or not field for field in self.body_fields):
                 raise TypeError("tensor I/O body fields must be non-empty strings")
-            unknown = set(self.body_fields) - {"pos_w", "quat_w"}
+            unknown = set(self.body_fields) - {"pos_w", "quat_w", "lin_vel_w", "ang_vel_w"}
             if unknown:
                 raise ValueError(
                     f"tensor I/O supports only body fields pos_w and quat_w; got {sorted(unknown)}"
@@ -1458,6 +1619,33 @@ class SimBackend(abc.ABC):
         """
         return {}
 
+    def configure_tensor_finite_validation(self, *, deferred: bool) -> None:
+        """Choose whether device finite verdicts resolve now or at a later boundary."""
+        if not isinstance(deferred, bool):
+            raise TypeError("deferred tensor finite validation must be bool")
+        if deferred:
+            raise NotImplementedError(
+                f"{self.backend_type} does not support deferred tensor finite validation"
+            )
+
+    def take_tensor_finite_verdict(self) -> Any | None:
+        """Return an accumulated device verdict without resolving it on the host."""
+        return None
+
+    def validate_pending_tensor_finite(self) -> bool:
+        """Resolve any backend-owned deferred finite verdict."""
+        return False
+
+    def get_tensor_transfer_diagnostics(self) -> Mapping[str, int]:
+        """Return backend-owned transfer and synchronization counts."""
+        return {
+            "h2d_count": 0,
+            "h2d_bytes": 0,
+            "d2h_count": 0,
+            "d2h_bytes": 0,
+            "scalar_sync_count": 0,
+        }
+
     def get_public_state_widths(self) -> PublicStateWidths:
         """Return canonical qpos/qvel widths for packed tensor reset layout."""
         raise NotImplementedError(
@@ -1486,6 +1674,29 @@ class SimBackend(abc.ABC):
         """Write selected mocap poses through the declared tensor lifecycle."""
         raise NotImplementedError(
             f"{self.backend_type} does not support tensor mocap pose writes: "
+            f"{self.get_tensor_execution()}"
+        )
+
+    def set_mocap_poses_tensor(self, poses: Mapping[str, tuple[Any, Any]]) -> None:
+        """Write several selected mocap poses with one device publication barrier.
+
+        Each mapping value is ``(env_indices, xyz_wxyz_poses)``. Implementations
+        validate the full batch on the selected device and publish derived
+        kinematics once after all body writes.
+        """
+        if not isinstance(poses, Mapping):
+            raise TypeError("mocap poses must map body names to (rows, poses) pairs")
+        for body_name, values in poses.items():
+            if not isinstance(body_name, str) or not body_name:
+                raise TypeError("mocap body names must be non-empty strings")
+            if not isinstance(values, tuple) or len(values) != 2:
+                raise TypeError("mocap pose values must be (rows, poses) pairs")
+            self.set_mocap_pose_tensor(body_name, values[0], values[1])
+
+    def set_mocap_poses_tensor_mask(self, poses: Mapping[str, tuple[Any, Any]]) -> None:
+        """Write full-width mocap poses selected by device-resident masks."""
+        raise NotImplementedError(
+            f"{self.backend_type} does not support tensor mocap mask writes: "
             f"{self.get_tensor_execution()}"
         )
 
@@ -1526,6 +1737,74 @@ class SimBackend(abc.ABC):
             f"{self.backend_type} does not support sensor views: {self.get_tensor_execution()}"
         )
 
+    def get_sensor_views(
+        self, names: Sequence[str], device: Any | None = None
+    ) -> Mapping[str, Any]:
+        """Read several named sensors under one declared tensor contract.
+
+        Implementations may use a backend frame plan to coalesce validation or
+        derived-state refresh. Returned tensors follow ``get_sensor_view``
+        lifetime and stream rules.
+        """
+        requested = tuple(names)
+        if isinstance(names, (str, bytes)) or len(set(requested)) != len(requested):
+            raise ValueError("sensor names must be a sequence of unique names")
+        return {name: self.get_sensor_view(name, device=device) for name in requested}
+
+    def get_site_pose_tensor(
+        self, names: Sequence[str], device: Any | None = None
+    ) -> TensorSitePoseViews:
+        """Return ordered world-frame named site poses as tensor views."""
+        raise NotImplementedError(
+            f"{self.backend_type} does not support tensor site poses: {self.get_tensor_execution()}"
+        )
+
+    def get_site_jacobian_tensor(
+        self,
+        site_name: str,
+        dof_indices: Sequence[int] | None = None,
+        device: Any | None = None,
+    ) -> TensorSiteJacobianViews:
+        """Return world-frame translational and rotational site Jacobians."""
+        raise NotImplementedError(
+            f"{self.backend_type} does not support tensor site Jacobians: "
+            f"{self.get_tensor_execution()}"
+        )
+
+    def get_site_kinematics_for_state_tensor(
+        self,
+        site_name: str,
+        env_indices: Any,
+        qpos: Any,
+        dof_indices: Sequence[int],
+        device: Any | None = None,
+        *,
+        mocap_poses: Mapping[str, Any] | None = None,
+    ) -> TensorSiteKinematicsViews:
+        """Evaluate selected site poses and Jacobians for caller-owned qpos.
+
+        This non-mutating query is intended for batched reset IK. It must not
+        publish candidate state into the live simulation or materialize
+        device state on the host. ``qpos`` is shaped ``(len(env_indices), nq)``;
+        optional ``mocap_poses`` maps body names to candidate ``(rows, 7)``
+        world poses aligned with ``env_indices``. Inputs must reside on the
+        declared device. Returned values
+        follow the lifetime and stream-ordering rules of
+        :class:`TensorSiteKinematicsViews`.
+        """
+        raise NotImplementedError(
+            f"{self.backend_type} does not support state-conditioned tensor site "
+            f"kinematics: {self.get_tensor_execution()}"
+        )
+
+    def bind_tensor_read_plan(self, spec: "TensorIOSpec") -> TensorReadPlan:
+        """Bind a stable public state/sensor/body/site read layout."""
+        if not self.get_tensor_capabilities().frame_read_plan:
+            raise NotImplementedError(
+                f"{self.backend_type} does not support tensor frame read plans"
+            )
+        return TensorReadPlan(self, spec)
+
     def get_tracked_body_views(
         self,
         body_names: Sequence[str] | None = None,
@@ -1552,6 +1831,16 @@ class SimBackend(abc.ABC):
         raise NotImplementedError(
             f"{self.backend_type} does not support tensor stepping: {self.get_tensor_execution()}"
         )
+
+    def set_control_targets(self, env_indices: Any, targets: Any) -> None:
+        """Set selected actuator targets at a backend-owned commit boundary."""
+        raise NotImplementedError(
+            f"{self.backend_type} does not expose public selected control writes"
+        )
+
+    def set_joint_generalized_force(self, env_indices: Any, dof_index: int, values: Any) -> None:
+        """Set one selected generalized-force column on a host backend."""
+        raise NotImplementedError(f"{self.backend_type} does not expose public joint-force writes")
 
     def set_generalized_force_tensor(
         self,
@@ -1602,6 +1891,8 @@ class SimBackend(abc.ABC):
         qpos: Any,
         qvel: Any,
         randomization: TensorResetRandomizationPayload | None = None,
+        *,
+        mocap_poses: Mapping[str, tuple[Any, Any]] | None = None,
     ) -> dict | None:
         """Set selected state through the adapter-declared tensor lifecycle.
 
@@ -1639,6 +1930,7 @@ class SimBackend(abc.ABC):
         randomization: TensorResetRandomizationPayload | None = None,
         *,
         full_refresh: bool = False,
+        mocap_poses_mask: Mapping[str, tuple[Any, Any]] | None = None,
     ) -> dict | None:
         """Set state selected by a fixed-width boolean mask.
 

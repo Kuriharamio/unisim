@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import warnings
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from typing import Any, cast
 
@@ -153,6 +153,16 @@ def _create_backend(
     bench_nsteps = kwargs.pop("bench_nsteps", 1)
     mjwarp_nconmax = kwargs.pop("mjwarp_nconmax", None)
     mjwarp_njmax = kwargs.pop("mjwarp_njmax", None)
+    mjwarp_disable_ccd_for_margin = kwargs.pop("mjwarp_disable_ccd_for_margin", False)
+    mjwarp_geom_collision_overrides = kwargs.pop("mjwarp_geom_collision_overrides", None)
+    if not isinstance(mjwarp_disable_ccd_for_margin, bool):
+        raise TypeError("mjwarp_disable_ccd_for_margin must be bool")
+    if mjwarp_geom_collision_overrides is not None and not isinstance(
+        mjwarp_geom_collision_overrides, Mapping
+    ):
+        raise TypeError("mjwarp_geom_collision_overrides must be a mapping or None")
+    if backend_type != "mjwarp" and mjwarp_geom_collision_overrides:
+        raise TypeError("mjwarp_geom_collision_overrides is only supported by mjwarp")
     newton_device = kwargs.pop("newton_device", None)
     newton_nconmax = kwargs.pop("newton_nconmax", None)
     newton_njmax = kwargs.pop("newton_njmax", None)
@@ -285,6 +295,8 @@ def _create_backend(
         )
         kwargs["nconmax"] = mjwarp_nconmax
         kwargs["njmax"] = mjwarp_njmax
+        kwargs["disable_ccd_for_margin"] = mjwarp_disable_ccd_for_margin
+        kwargs["geom_collision_overrides"] = mjwarp_geom_collision_overrides
         return MjwarpBackend(cast(SceneCfg, scene), num_envs, sim_dt, **kwargs)
     if backend_type == "newton":
         from .backend.newton.backend import NewtonBackend

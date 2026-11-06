@@ -261,8 +261,10 @@ def test_mujoco_packed_body_pose_request_fails_closed(tmp_path: Path) -> None:
         TensorIOSpec(body_names=(b"base",), body_fields=("pos_w",))
     with pytest.raises(ValueError, match="body names must be unique"):
         TensorIOSpec(body_names=("base", "base"), body_fields=("pos_w",))
+    velocity_spec = TensorIOSpec(body_names=("base",), body_fields=("lin_vel_w",))
+    assert velocity_spec.body_fields == ("lin_vel_w",)
     with pytest.raises(ValueError, match="only body fields pos_w and quat_w"):
-        TensorIOSpec(body_names=("base",), body_fields=("lin_vel_w",))
+        TensorIOSpec(body_names=("base",), body_fields=("unknown_field",))
     with pytest.raises(ValueError, match="body request must name at least one body field"):
         TensorIOSpec(body_names=("base",), body_fields=())
     with pytest.raises(KeyError, match="missing from the tracked namespace"):

@@ -61,9 +61,11 @@ class PackedResetTransaction:
         self.device = torch.device(device)
         self.backend = backend
         self._torch = torch
+        self._capabilities = capabilities
         self._baselines: dict[str, Any] = {}
         self._staged: dict[str, Any] = {}
         self._mocap_staged: dict[str, tuple[Any, Any]] = {}
+        self._mocap_mask_staged: dict[str, tuple[Any, Any]] = {}
         self._default_qpos: Any | None = None
         self._default_qvel: Any | None = None
         self._qpos: Any | None = None
@@ -170,6 +172,7 @@ class PackedResetTransaction:
         if field is None:
             self._staged.clear()
             self._mocap_staged.clear()
+            self._mocap_mask_staged.clear()
             return
         self._validate_field(field)
         self._staged.pop(field, None)
@@ -341,7 +344,13 @@ class PackedResetTransaction:
         )
         compose_ms = (time.perf_counter() - started) * 1000.0
         commit_started = time.perf_counter()
-        result = self.backend.set_state_tensor(rows, qpos, qvel, payload)
+        if self._mocap_staged:
+            result = self.backend.set_state_tensor(
+                rows, qpos, qvel, payload, mocap_poses=self._mocap_staged
+            )
+            self._mocap_staged.clear()
+        else:
+            result = self.backend.set_state_tensor(rows, qpos, qvel, payload)
         self._apply_mocap_poses()
         commit_ms = (time.perf_counter() - commit_started) * 1000.0
         for field, staged_final in finals.items():
@@ -375,7 +384,20 @@ class PackedResetTransaction:
         )
         compose_ms = (time.perf_counter() - started) * 1000.0
         commit_started = time.perf_counter()
-        result = self.backend.set_state_tensor_mask(mask, qpos, qvel, payload, full_refresh=False)
+        if self._mocap_mask_staged:
+            result = self.backend.set_state_tensor_mask(
+                mask,
+                qpos,
+                qvel,
+                payload,
+                full_refresh=False,
+                mocap_poses_mask=self._mocap_mask_staged,
+            )
+            self._mocap_mask_staged.clear()
+        else:
+            result = self.backend.set_state_tensor_mask(
+                mask, qpos, qvel, payload, full_refresh=False
+            )
         self._apply_mocap_poses()
         commit_ms = (time.perf_counter() - commit_started) * 1000.0
         for field, staged_final in finals.items():
@@ -417,6 +439,37 @@ class PackedResetTransaction:
             self._torch.cat((previous_poses[keep], poses)),
         )
 
+    def write_mocap_pose_mask(self, body_name: str, reset_mask: Any, poses: Any) -> None:
+        """Stage full-width mocap poses selected by a fixed-width device mask."""
+        capabilities = self.backend.get_tensor_capabilities()
+        if not capabilities.packed_reset_mocap or not capabilities.mask_selected_reset:
+            raise NotImplementedError(
+                f"{self.backend.backend_type} does not support packed mocap mask writes"
+            )
+        if not isinstance(body_name, str) or not body_name:
+            raise TypeError("packed reset mocap body_name must be a non-empty string")
+        mask = self._validate_state_mask(reset_mask)
+        if (
+            not isinstance(poses, self._torch.Tensor)
+            or poses.dtype != self._torch.float32
+            or not poses.is_contiguous()
+            or poses.device != self.device
+            or tuple(poses.shape) != (int(self.backend.num_envs), 7)
+        ):
+            raise TypeError(
+                "packed reset mocap mask poses must be contiguous float32 "
+                f"on {self.device} with shape {(int(self.backend.num_envs), 7)}"
+            )
+        previous = self._mocap_mask_staged.get(body_name)
+        if previous is None:
+            self._mocap_mask_staged[body_name] = (mask, poses)
+            return
+        previous_mask, previous_poses = previous
+        self._mocap_mask_staged[body_name] = (
+            previous_mask | mask,
+            self._torch.where(mask[:, None], poses, previous_poses),
+        )
+
     def commit_mocap_poses(self) -> dict:
         """Commit only staged mocap poses without a generalized-state reset."""
         started = time.perf_counter()
@@ -431,10 +484,12 @@ class PackedResetTransaction:
         }
 
     def _apply_mocap_poses(self) -> None:
-        for body_name in sorted(self._mocap_staged):
-            rows, poses = self._mocap_staged[body_name]
-            self.backend.set_mocap_pose_tensor(body_name, rows, poses)
+        if self._mocap_staged:
+            self.backend.set_mocap_poses_tensor(self._mocap_staged)
+        if self._mocap_mask_staged:
+            self.backend.set_mocap_poses_tensor_mask(self._mocap_mask_staged)
         self._mocap_staged.clear()
+        self._mocap_mask_staged.clear()
 
     def _validate_field(self, field: str) -> None:
         _validate_reset_term(field)
@@ -490,8 +545,7 @@ class PackedResetTransaction:
         expected = (int(reset_mask.shape[0]), int(column_tensor.numel()))
         if tuple(values.shape) != expected:
             raise ValueError(f"packed reset {name} values must have shape {expected}")
-        if not bool(self._torch.isfinite(values).all()):
-            raise ValueError(f"packed reset {name} values must be finite")
+        self._validate_finite(values, name)
         expanded_mask = _expand_mask(reset_mask, state.ndim)
         selected = state[:, column_tensor]
         merged = self._torch.where(expanded_mask, values, selected)
@@ -518,8 +572,7 @@ class PackedResetTransaction:
         )
         if tuple(values.shape) != expected:
             raise ValueError(f"packed reset {field} values must have shape {expected}")
-        if not bool(self._torch.isfinite(values).all()):
-            raise ValueError(f"packed reset {field} values must be finite")
+        self._validate_finite(values, field)
         return values
 
     def _validate_mocap_poses(self, poses: Any, rows: Any) -> Any:
@@ -532,13 +585,8 @@ class PackedResetTransaction:
             raise ValueError(f"packed reset mocap poses must live on {self.device}")
         if tuple(poses.shape) != expected:
             raise ValueError(f"packed reset mocap poses must have shape {expected}")
-        if not bool(self._torch.isfinite(poses).all()):
-            raise ValueError("packed reset mocap poses must be finite")
-        norms = self._torch.linalg.vector_norm(poses[:, 3:], dim=1)
-        if not bool(
-            self._torch.allclose(norms, self._torch.ones_like(norms), rtol=1e-5, atol=1e-6)
-        ):
-            raise ValueError("packed reset mocap poses require unit wxyz quaternions")
+        # Finite and quaternion checks are coalesced by the backend bulk
+        # publication barrier when all staged bodies are committed.
         return poses
 
     def _column_tensor(self, columns: Any | None, width: int, name: str) -> Any:
@@ -547,10 +595,19 @@ class PackedResetTransaction:
         column_tensor = self._torch.as_tensor(columns, dtype=self._torch.int64, device=self.device)
         if column_tensor.ndim != 1:
             raise TypeError(f"packed reset {name} columns must be one-dimensional")
-        if column_tensor.numel() and (
-            bool((column_tensor < 0).any()) or bool((column_tensor >= width).any())
-        ):
-            raise ValueError(f"packed reset {name} columns must be within [0, {width})")
+        if column_tensor.numel():
+            invalid = ((column_tensor < 0) | (column_tensor >= width)).any()
+            if (
+                self._capabilities.deferred_finite_validation
+                and self.device.type == "cuda"
+                and callable(getattr(self._torch, "_assert_async", None))
+            ):
+                self._torch._assert_async(
+                    ~invalid,
+                    f"packed reset {name} columns must be within [0, {width})",
+                )
+            elif bool(invalid):
+                raise ValueError(f"packed reset {name} columns must be within [0, {width})")
         return column_tensor
 
     def _validate_state_vector(self, values: Any, name: str) -> Any:
@@ -560,8 +617,7 @@ class PackedResetTransaction:
             raise TypeError(f"packed reset {name} must be a contiguous 1-D float32 tensor")
         if values.device != self.device:
             raise ValueError(f"packed reset {name} must live on {self.device}")
-        if not bool(self._torch.isfinite(values).all()):
-            raise ValueError(f"packed reset {name} must be finite")
+        self._validate_finite(values, name)
         return values
 
     def _validate_state_values(
@@ -582,6 +638,17 @@ class PackedResetTransaction:
         expected = (int(rows.shape[0]), column_count)
         if tuple(values.shape) != expected:
             raise ValueError(f"packed reset {name} values must have shape {expected}")
+        self._validate_finite(values, name)
+        return values
+
+    def _validate_finite(self, values: Any, name: str) -> None:
+        """Validate on the backend commit path when it supports deferred checks.
+
+        MJWarp coalesces reset state, randomization, and mocap predicates into
+        its configured finite-verdict boundary. Reading a CUDA scalar here
+        would force a synchronization before that single commit.
+        """
+        if self._capabilities.deferred_finite_validation:
+            return
         if not bool(self._torch.isfinite(values).all()):
             raise ValueError(f"packed reset {name} values must be finite")
-        return values

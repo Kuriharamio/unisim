@@ -1452,9 +1452,7 @@ class SuperDexBackend(SimBackend):
                 raise NotImplementedError(
                     f"portable SuperDex entity {entity.name!r} has no floating root state"
                 )
-            return RootStateLayout(
-                tuple(entity.root_qpos_indices), tuple(entity.root_qvel_indices)
-            )
+            return RootStateLayout(tuple(entity.root_qpos_indices), tuple(entity.root_qvel_indices))
         body = self.get_body_id(root_body_name)
         if not self.model.floating or body != self.model.root_body_id:
             raise NotImplementedError(
@@ -1818,6 +1816,8 @@ class SuperDexBackend(SimBackend):
         qpos: Any,
         qvel: Any,
         randomization: TensorResetRandomizationPayload | None = None,
+        *,
+        mocap_poses: Any | None = None,
     ) -> dict | None:
         """Bridge selected reset state through the persistent direct API plan."""
         import torch
@@ -1825,11 +1825,12 @@ class SuperDexBackend(SimBackend):
         from .tensor import require_superdex_tensor_runtime
 
         require_superdex_tensor_runtime(self)
+        if mocap_poses:
+            raise NotImplementedError("SuperDex tensor reset does not support mocap poses")
         if randomization is not None:
             if not isinstance(randomization, TensorResetRandomizationPayload):
                 raise TypeError(
-                    "SuperDex tensor reset randomization must be a "
-                    "TensorResetRandomizationPayload"
+                    "SuperDex tensor reset randomization must be a TensorResetRandomizationPayload"
                 )
             if not randomization.is_empty():
                 requested = ", ".join(sorted(randomization.requested_terms()))

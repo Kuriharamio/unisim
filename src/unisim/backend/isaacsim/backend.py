@@ -636,10 +636,7 @@ class IsaacSimBackend(MjcfSubprocessBackend):
                 )
 
         body_mass: np.ndarray | None = None
-        if (
-            RESET_TERM_BODY_MASS in host_values
-            or RESET_TERM_BASE_MASS in host_values
-        ):
+        if RESET_TERM_BODY_MASS in host_values or RESET_TERM_BASE_MASS in host_values:
             body_mass = (
                 self._coerce_mapped_reset_field(
                     host_values[RESET_TERM_BODY_MASS], "body_mass", (count, layout.nbody)
@@ -1594,7 +1591,11 @@ class IsaacSimBackend(MjcfSubprocessBackend):
         qpos: Any,
         qvel: Any,
         randomization: TensorResetRandomizationPayload | None = None,
+        *,
+        mocap_poses: Any | None = None,
     ) -> dict | None:
+        if mocap_poses:
+            raise NotImplementedError("IsaacSim tensor reset does not support mocap poses")
         if self.get_tensor_execution() is TensorExecution.UNSUPPORTED:
             return super().set_state_tensor(env_indices, qpos, qvel, randomization)
         if randomization is not None and not isinstance(
@@ -1680,10 +1681,13 @@ class IsaacSimBackend(MjcfSubprocessBackend):
         randomization: TensorResetRandomizationPayload | None = None,
         *,
         full_refresh: bool = False,
+        mocap_poses_mask: Any | None = None,
     ) -> dict | None:
         """Commit full-width state through a backend-owned mask projection."""
 
         import_torch()
+        if mocap_poses_mask:
+            raise NotImplementedError("IsaacSim tensor mask reset does not support mocap poses")
         if full_refresh:
             raise NotImplementedError("isaacsim CUDA IPC mask reset is a selected-row boundary")
         if self.get_tensor_execution() is TensorExecution.UNSUPPORTED:

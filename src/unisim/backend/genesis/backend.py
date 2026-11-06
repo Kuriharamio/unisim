@@ -3154,9 +3154,13 @@ class GenesisBackend(SimBackend):
         qpos: Any,
         qvel: Any,
         randomization: TensorResetRandomizationPayload | None = None,
+        *,
+        mocap_poses: Any | None = None,
     ) -> dict[str, dict[str, float]]:
         """Commit selected CUDA state while preserving untouched rows."""
 
+        if mocap_poses:
+            raise NotImplementedError("genesis tensor reset does not support mocap poses")
         reset_started = time.perf_counter()
         self._tensor_device()
         self._require_state("tensor reset")
@@ -3236,6 +3240,7 @@ class GenesisBackend(SimBackend):
         randomization: TensorResetRandomizationPayload | None = None,
         *,
         full_refresh: bool = False,
+        mocap_poses_mask: Any | None = None,
     ) -> dict[str, dict[str, float]]:
         """Commit full-width CUDA state selected by a persistent bool mask.
 
@@ -3243,6 +3248,8 @@ class GenesisBackend(SimBackend):
         directly, so the fixed-width reset boundary does not compact selected
         rows on the host or device.
         """
+        if mocap_poses_mask:
+            raise NotImplementedError("genesis tensor mask reset does not support mocap poses")
         if full_refresh:
             raise NotImplementedError("genesis tensor mask reset is a selected-row boundary")
         reset_started = time.perf_counter()

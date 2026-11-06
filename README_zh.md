@@ -54,6 +54,7 @@ backend.step(ctrl)         # 热路径：校验数组和缓存句柄
 - [Benchmark API 预留](docs/zh/benchmark-api.md) — 预留的 benchmark 结果 schema
 - [Ray-Query 插件契约](docs/zh/ray-query.md) — backend-neutral 的 ray caster 生命周期、capability 与插件边界
 - [Ray tensor 生命周期](docs/zh/adr-ray-tensor-lifecycle.md) — 调用方持有的 pose source、packed/device-resident ray 数据面，以及 stream/output 所有权
+- [MJWarp 设备 tensor 契约](docs/zh/mjwarp-device-contract.md) — 批量设备读取、site 运动学、重置、力写入、诊断与 stream 所有权
 - [发布手册](docs/zh/release.md) — TestPyPI 检查与自动化生产发布
 - [SuperDex CPU 配置](docs/zh/superdex.md) — 实验性适配器与原生资产细节
 

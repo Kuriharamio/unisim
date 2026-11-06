@@ -744,7 +744,7 @@ def test_mjwarp_tensor_reset_validates_rows(tmp_path: Path) -> None:
 
 
 @pytest.mark.slow
-def test_mjwarp_mask_tensor_reset_preserves_unselected_rows(tmp_path: Path) -> None:
+def test_mjwarp_mask_tensor_reset_preserves_unselected_rows(tmp_path: Path, monkeypatch) -> None:
     torch = pytest.importorskip("torch")
     backend = _make_backend(tmp_path, "mask_reset.xml", num_envs=4)
     backend.step_tensor(torch.zeros((4, 1), dtype=torch.float32, device="cuda"), nsteps=1)
@@ -756,6 +756,14 @@ def test_mjwarp_mask_tensor_reset_preserves_unselected_rows(tmp_path: Path) -> N
     qvel = views["qvel"].clone()
     qpos[mask] += 0.125
     qvel[mask] += 0.25
+
+    forward_calls = []
+    execute_forward = backend._execute_device_forward
+    monkeypatch.setattr(
+        backend,
+        "_execute_device_forward",
+        lambda: (forward_calls.append(True), execute_forward())[1],
+    )
 
     result = backend.set_state_tensor_mask(mask, qpos, qvel)
 
@@ -771,8 +779,109 @@ def test_mjwarp_mask_tensor_reset_preserves_unselected_rows(tmp_path: Path) -> N
         "set_state_tensor_model_update_ms",
         "set_state_tensor_sensor_refresh_ms",
     }
-    # Experimental B leaves publication lazy; no eager full-batch forward runs.
-    assert result["timing"]["set_state_tensor_sensor_refresh_ms"] < 0.01
+    # Lazy publication leaves derived sensors/tracked bodies untouched.
+    assert forward_calls == []
+
+
+@pytest.mark.parametrize("selector_kind", ("rows", "mask"))
+@pytest.mark.parametrize("force_field", ("joint_f", "body_f"))
+def test_mjwarp_generalized_force_inputs_survive_selected_reset(
+    tmp_path: Path, selector_kind: str, force_field: str
+) -> None:
+    torch = pytest.importorskip("torch")
+    backend = _make_backend(tmp_path, f"persistent-force-{selector_kind}-{force_field}.xml")
+    try:
+        device = torch.device("cuda", torch.cuda.current_device())
+        views = backend.get_state_views(("qpos", "qvel"))
+        if force_field == "joint_f":
+            force = torch.zeros(
+                (backend.num_envs, backend.get_public_state_widths().nv),
+                dtype=torch.float32,
+                device=device,
+            )
+            force[1, 0] = 1.0
+            backend.set_generalized_force_tensor(joint_f=force)
+        else:
+            force = torch.zeros(
+                (backend.num_envs, backend._nbody, 6),
+                dtype=torch.float32,
+                device=device,
+            )
+            body_id = int(backend.get_body_ids(("base",))[0])
+            force[1, body_id, 0] = 1.0
+            backend.set_generalized_force_tensor(body_f=force)
+
+        rows = torch.tensor([1], dtype=torch.int64, device=device)
+        if selector_kind == "rows":
+            backend.set_state_tensor(
+                rows,
+                torch.zeros((1, views["qpos"].shape[1]), dtype=torch.float32, device=device),
+                torch.zeros((1, views["qvel"].shape[1]), dtype=torch.float32, device=device),
+            )
+        else:
+            mask = torch.tensor([False, True], dtype=torch.bool, device=device)
+            backend.set_state_tensor_mask(
+                mask,
+                torch.zeros_like(views["qpos"]),
+                torch.zeros_like(views["qvel"]),
+            )
+
+        control = torch.zeros(
+            (backend.num_envs, backend.num_actuators),
+            dtype=torch.float32,
+            device=device,
+        )
+        result = backend.step_tensor(control, nsteps=4)
+        result["completion"].wait_before_read(torch.cuda.current_stream(device))
+        qpos = backend.get_state_views(("qpos",))["qpos"]
+        assert qpos[1, 0].abs().item() > 1e-6
+        assert qpos[0, 0].abs().item() <= 1e-6
+    finally:
+        backend.close()
+
+
+def test_mjwarp_packed_reset_defers_cuda_scalar_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    torch = pytest.importorskip("torch")
+    backend = _make_backend(tmp_path, "packed-reset-deferred-validation.xml")
+    try:
+        backend.configure_tensor_finite_validation(deferred=True)
+        device = torch.device("cuda", torch.cuda.current_device())
+        views = backend.get_state_views(("qpos", "qvel"))
+        rows = torch.tensor([1], dtype=torch.int64, device=device)
+        qpos = torch.zeros((1, views["qpos"].shape[1]), dtype=torch.float32, device=device)
+        qvel = torch.zeros((1, views["qvel"].shape[1]), dtype=torch.float32, device=device)
+        original_bool = torch.Tensor.__bool__
+        original_item = torch.Tensor.item
+
+        def reject_cuda_bool(value: torch.Tensor) -> bool:
+            if value.device.type == "cuda":
+                raise AssertionError("packed reset synchronously read a CUDA scalar")
+            return original_bool(value)
+
+        def reject_cuda_item(value: torch.Tensor, *args: Any, **kwargs: Any) -> Any:
+            if value.device.type == "cuda":
+                raise AssertionError("packed reset synchronously read a CUDA scalar")
+            return original_item(value, *args, **kwargs)
+
+        with monkeypatch.context() as patcher:
+            patcher.setattr(torch.Tensor, "__bool__", reject_cuda_bool)
+            patcher.setattr(torch.Tensor, "item", reject_cuda_item)
+            transaction = backend.bind_packed_reset(device=device)
+            transaction.set_state_default(qpos[0].contiguous(), qvel[0].contiguous())
+            transaction.begin_state(rows)
+            transaction.write_state(
+                rows,
+                qpos_columns=(0,),
+                qpos_values=torch.zeros((1, 1), dtype=torch.float32, device=device),
+                qvel_values=qvel,
+            )
+            transaction.commit(rows)
+
+        assert backend.get_tensor_transfer_diagnostics()["scalar_sync_count"] == 0
+    finally:
+        backend.close()
 
 
 @pytest.mark.slow
@@ -994,7 +1103,7 @@ def test_mjwarp_device_push_rejects_host_payload_and_input_hazards(tmp_path: Pat
         backend.push_robots(_push_payload(torch, torch.zeros((backend.num_envs, 3))))
 
 
-def test_mjwarp_tensor_reset_rejects_pending_wrench_and_mocap(tmp_path: Path) -> None:
+def test_mjwarp_tensor_reset_rejects_pending_wrench_and_commits_mocap(tmp_path: Path) -> None:
     torch = pytest.importorskip("torch")
     pushed = _make_backend(tmp_path, "pushed.xml", base_name="base")
     pushed.push_robots(_push_payload(torch, torch.ones((pushed.num_envs, 3))))
@@ -1006,11 +1115,15 @@ def test_mjwarp_tensor_reset_rejects_pending_wrench_and_mocap(tmp_path: Path) ->
 
     mocap_model = MODEL.replace(
         "</worldbody>",
-        "<body name='marker' mocap='true'><geom type='sphere' size='0.01'/></body></worldbody>",
+        "<body name='marker' mocap='true'><site name='marker_site'/><geom type='sphere' "
+        "size='0.01'/></body></worldbody>",
     )
     mocap = _make_backend(tmp_path, "mocap.xml", xml=mocap_model)
-    with pytest.raises(NotImplementedError, match="mocap"):
-        mocap.set_state_tensor(rows, qpos, qvel)
+    pose = torch.tensor([[1.0, 2.0, 3.0, 1.0, 0.0, 0.0, 0.0]], device="cuda")
+    mocap.set_state_tensor(rows, qpos, qvel, mocap_poses={"marker": (rows, pose)})
+    torch.cuda.synchronize()
+    snapshot = mocap.get_physics_state()
+    np.testing.assert_allclose(snapshot[0, 3:6], [1.0, 2.0, 3.0], atol=1e-6)
 
 
 def test_mjwarp_host_step_tensor_sensor_view_refreshes_tracking(tmp_path: Path) -> None:

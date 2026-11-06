@@ -37,9 +37,14 @@ from unisim.backend.base import (
     SimBackend,
     TensorDataPlane,
     TensorExecution,
+    TensorIOSpec,
     TensorLifecycleCapabilities,
     TensorProcessTopology,
+    TensorReadPlan,
     TensorRuntimeDiagnostic,
+    TensorSiteJacobianViews,
+    TensorSiteKinematicsViews,
+    TensorSitePoseViews,
     TrackedBodyStateViews,
     normalize_play_render_mode,
 )
@@ -259,6 +264,8 @@ class MjwarpBackend(SimBackend):
         nconmax: int | None = None,
         njmax: int | None = None,
         add_body_sensors: bool = False,
+        disable_ccd_for_margin: bool = False,
+        geom_collision_overrides: Mapping[str, tuple[int, int]] | None = None,
         **unexpected_kwargs: Any,
     ) -> None:
         self._composed_scene = None
@@ -290,6 +297,8 @@ class MjwarpBackend(SimBackend):
                 nconmax=nconmax,
                 njmax=njmax,
                 add_body_sensors=add_body_sensors,
+                disable_ccd_for_margin=disable_ccd_for_margin,
+                geom_collision_overrides=geom_collision_overrides,
                 **unexpected_kwargs,
             )
             if self._composed_scene is not None:
@@ -311,6 +320,8 @@ class MjwarpBackend(SimBackend):
         nconmax: int | None = None,
         njmax: int | None = None,
         add_body_sensors: bool = False,
+        disable_ccd_for_margin: bool = False,
+        geom_collision_overrides: Mapping[str, tuple[int, int]] | None = None,
         **unexpected_kwargs: Any,
     ) -> None:
         require_scene_composition_support(scene, "mjwarp")
@@ -326,6 +337,29 @@ class MjwarpBackend(SimBackend):
                 "MjwarpBackend add_body_sensors must be bool, got "
                 f"{type(add_body_sensors).__name__}"
             )
+        if not isinstance(disable_ccd_for_margin, bool):
+            raise TypeError("disable_ccd_for_margin must be bool")
+        if geom_collision_overrides is None:
+            geom_collision_overrides = {}
+        if not isinstance(geom_collision_overrides, Mapping):
+            raise TypeError("geom_collision_overrides must be a mapping")
+        normalized_collision_overrides: dict[str, tuple[int, int]] = {}
+        for name, pair in geom_collision_overrides.items():
+            if not isinstance(name, str) or not name:
+                raise TypeError("geom collision override names must be non-empty strings")
+            if (
+                not isinstance(pair, (tuple, list))
+                or len(pair) != 2
+                or any(
+                    isinstance(value, bool) or not isinstance(value, int) or value < 0
+                    for value in pair
+                )
+            ):
+                raise ValueError(
+                    f"geom collision override {name!r} must contain non-negative integer "
+                    "contype/conaffinity"
+                )
+            normalized_collision_overrides[name] = (int(pair[0]), int(pair[1]))
         nconmax = self._require_capacity(nconmax, name="nconmax", default=512)
         njmax = self._require_capacity(njmax, name="njmax", default=512)
         if push_body_name is not None and not isinstance(push_body_name, str):
@@ -359,10 +393,26 @@ class MjwarpBackend(SimBackend):
         self._njmax = njmax
         self._add_body_sensors = add_body_sensors
         self._tracked_body_names = scene_context.tracked_body_names
+        self._tracked_body_column_cache: dict[tuple[str, ...], Any] = {}
         self._tracked_sensor_slots: dict[str, tuple[int, int]] = {}
         self._tracked_sensor_names: set[str] = set()
         self._state_torch_views: dict[str, Any] = {}
+        self._tensor_scalar_sync_count = 0
+        self._tensor_reset_commit_count = 0
+        self._defer_tensor_finite_validation = False
+        self._pending_tensor_finite_verdict: Any | None = None
         self._sensor_torch_views: dict[str, Any] = {}
+        self._site_pose_torch_views: dict[tuple[str, ...], tuple[Any, Any]] = {}
+        self._site_pose_indices: dict[tuple[str, ...], Any] = {}
+        self._site_jacobian_torch_views: dict[tuple[str, tuple[int, ...]], tuple[Any, Any]] = {}
+        self._site_jacobian_indices: dict[tuple[int, ...], Any] = {}
+        self._dof_root_indices: Any | None = None
+        self._site_dof_masks: dict[str, Any] = {}
+        self._site_state_kinematics_views: dict[
+            tuple[str, tuple[int, ...], int], tuple[Any, Any, Any, Any]
+        ] = {}
+        self._state_kinematics_scratch_data: Any | None = None
+        self._state_kinematics_scratch_capacity = 0
         # Live Torch views of per-world DR Model fields (separate from the
         # Data-field views above) plus the set of host mirrors a device-side
         # scatter has left stale.
@@ -392,6 +442,15 @@ class MjwarpBackend(SimBackend):
         else:
             self._cpu_model = self._fixed_variant_realization.canonical_model
             self.cleanup_scene_assets()
+        for name, (contype, conaffinity) in normalized_collision_overrides.items():
+            geom_id = int(
+                deps.mujoco.mj_name2id(self._cpu_model, deps.mujoco.mjtObj.mjOBJ_GEOM, name)
+            )
+            if geom_id < 0:
+                raise ValueError(f"geom collision override references unknown geom {name!r}")
+            self._cpu_model.geom_contype[geom_id] = contype
+            self._cpu_model.geom_conaffinity[geom_id] = conaffinity
+        self._geom_collision_overrides = dict(normalized_collision_overrides)
         # mujoco_warp may flatten the solver body tree. Preserve the compiled
         # source parentage for public ray ancestry before the device upload.
         self._source_body_parent_ids = np.asarray(
@@ -399,6 +458,12 @@ class MjwarpBackend(SimBackend):
         ).copy()
         report_requested = mujoco_model_configuration(self._cpu_model, self._mujoco)
         self._cpu_model.opt.timestep = self._sim_dt
+        self._ccd_disabled_for_margin = bool(disable_ccd_for_margin)
+        if self._ccd_disabled_for_margin:
+            self._cpu_model.opt.disableflags |= int(
+                self._mujoco.mjtDisableBit.mjDSBL_MULTICCD
+                | self._mujoco.mjtDisableBit.mjDSBL_NATIVECCD
+            )
         self._device_model = deps.mujoco_warp.put_model(self._cpu_model)
         self._device_data = deps.mujoco_warp.make_data(
             self._cpu_model,
@@ -521,6 +586,11 @@ class MjwarpBackend(SimBackend):
         self._reset_scratch_sensor_storage: Any | None = None
         self._reset_scratch_sensor_cache: np.ndarray | None = None
         self._tensor_reset_defaults: dict[str, Any] | None = None
+        # Explicit generalized-force inputs are persistent control channels.
+        # Keep caller-independent device copies so selected state resets can
+        # restore those inputs after the MJWarp reset graph clears its data.
+        self._tensor_generalized_joint_force: Any | None = None
+        self._tensor_generalized_body_force: Any | None = None
         self._torch_true_verdict: Any | None = None
         self._completion_sequence = 0
         self._completion_producer_id = f"mjwarp-{id(self):016x}"
@@ -1616,6 +1686,9 @@ class MjwarpBackend(SimBackend):
         self._refresh_host_cache()
         self._time_cache[:] = self._device_data.time.numpy()
         self._ctrl_staging[:] = self._device_data.ctrl.numpy()
+        if self._nmocap:
+            self._mocap_pos[:] = self._device_data.mocap_pos.numpy()
+            self._mocap_quat[:] = self._device_data.mocap_quat.numpy()
         self._host_cache_stale = False
         self._tracked_body_state_dirty = False
         self._tracked_body_host_dirty = False
@@ -1675,9 +1748,69 @@ class MjwarpBackend(SimBackend):
             )
         if not bool(value.is_contiguous()):
             raise ValueError(f"mjwarp tensor {name} must be contiguous")
-        if check_finite and value.numel() and not bool(torch.isfinite(value).all()):
-            raise ValueError(f"mjwarp tensor {name} must contain finite values")
+        if check_finite and value.numel():
+            verdict = torch.isfinite(value).all()
+            if value.device.type == "cuda":
+                self._tensor_scalar_sync_count += 1
+            if not bool(verdict):
+                raise ValueError(f"mjwarp tensor {name} must contain finite values")
         return value
+
+    def configure_tensor_finite_validation(self, *, deferred: bool) -> None:
+        """Select immediate or boundary-deferred validation for tensor hot paths."""
+        if not isinstance(deferred, bool):
+            raise TypeError("deferred tensor finite validation must be bool")
+        self._defer_tensor_finite_validation = deferred
+
+    def _stage_tensor_finite_verdict(self, value: Any, *, name: str) -> None:
+        """Validate now in strict mode or accumulate a device verdict for polling."""
+        import torch
+
+        verdict = torch.isfinite(value).all()
+        if not self._defer_tensor_finite_validation:
+            if value.device.type == "cuda":
+                self._tensor_scalar_sync_count += 1
+            if not bool(verdict):
+                raise ValueError(f"mjwarp tensor {name} must contain finite values")
+            return
+        if self._pending_tensor_finite_verdict is None:
+            self._pending_tensor_finite_verdict = verdict
+        else:
+            self._pending_tensor_finite_verdict.logical_and_(verdict)
+
+    def validate_pending_tensor_finite(self) -> bool:
+        """Resolve accumulated tensor validation at a caller-selected boundary.
+
+        Returns ``True`` when a device verdict was consumed. In deferred mode,
+        the ordinary step path only writes the verdict carrier and never reads
+        a CUDA scalar on the host.
+        """
+        verdict = self._pending_tensor_finite_verdict
+        if verdict is None:
+            return False
+        self._pending_tensor_finite_verdict = None
+        if verdict.device.type == "cuda":
+            self._tensor_scalar_sync_count += 1
+        if not bool(verdict):
+            raise ValueError("mjwarp tensor control or force input must contain finite values")
+        return True
+
+    def take_tensor_finite_verdict(self) -> Any | None:
+        """Transfer the pending device verdict into an owning TorchEnv guard."""
+        verdict = self._pending_tensor_finite_verdict
+        self._pending_tensor_finite_verdict = None
+        return verdict
+
+    def get_tensor_transfer_diagnostics(self) -> dict[str, int]:
+        """Return backend-owned transfer and scalar-verdict synchronization counts."""
+        return {
+            "h2d_count": 0,
+            "h2d_bytes": 0,
+            "d2h_count": 0,
+            "d2h_bytes": 0,
+            "scalar_sync_count": self._tensor_scalar_sync_count,
+            "state_reset_commit_count": self._tensor_reset_commit_count,
+        }
 
     def _torch_rows_flag(self, rows: Any) -> Any:
         """Return a device-resident bool scalar for unique in-range reset rows."""
@@ -1715,6 +1848,8 @@ class MjwarpBackend(SimBackend):
             )
         if rule == "unit_quat":
             return torch.isfinite(value).all() & ((value.norm(dim=-1) - 1.0).abs() <= 1e-5).all()
+        if rule == "positive":
+            return torch.isfinite(value).all() & (value > 1.0e-12).all()
         raise ValueError(f"unknown mjwarp tensor value rule {rule!r}")
 
     def _torch_true_flag_value(self, device: Any) -> Any:
@@ -1740,17 +1875,19 @@ class MjwarpBackend(SimBackend):
             )
         if rule == "unit_quat":
             return f"mjwarp tensor {name} requires unit wxyz quaternions"
+        if rule == "positive":
+            return f"mjwarp tensor {name} must be finite and greater than zero"
         raise ValueError(f"unknown mjwarp tensor value rule {rule!r}")
 
     def _validate_torch_fused(self, entries: list[tuple[str, str, Any, Any]]) -> None:
-        """Aggregate per-operand value rules into one reduction, one D2H sync.
+        """Aggregate per-operand value rules into one device verdict.
 
         Each entry is ``(name, rule, value, flag)`` with ``flag`` a
         device-resident bool scalar; structural checks (type, shape, dtype,
         device, contiguity) already ran host-side in ``_validate_torch_operand``.
-        The happy path costs exactly one synchronization no matter how many
-        operands are staged.  A failed aggregate re-checks each operand on the
-        cold failure path so the raised error still names its field.
+        Strict mode resolves the aggregate immediately. Deferred mode folds it
+        into the persistent verdict and leaves resolution to the configured
+        validation boundary.
         """
         import torch
 
@@ -1758,6 +1895,14 @@ class MjwarpBackend(SimBackend):
         if not live:
             return
         aggregate = torch.stack([flag.reshape(()) for _, _, _, flag in live]).all()
+        if self._defer_tensor_finite_validation:
+            if self._pending_tensor_finite_verdict is None:
+                self._pending_tensor_finite_verdict = aggregate
+            else:
+                self._pending_tensor_finite_verdict.logical_and_(aggregate)
+            return
+        if aggregate.device.type == "cuda":
+            self._tensor_scalar_sync_count += 1
         if bool(aggregate):
             return
         for name, rule, value, flag in live:
@@ -1767,6 +1912,112 @@ class MjwarpBackend(SimBackend):
                 raise ValueError(f"mjwarp tensor {name} must contain finite values")
             raise ValueError(self._torch_rule_error(name, rule))
         raise ValueError("mjwarp tensor validation failed")
+
+    def _prepare_reset_mocap_poses(
+        self,
+        poses: Mapping[str, tuple[Any, Any]] | None,
+        validation: list[tuple[str, str, Any, Any]],
+        *,
+        masked: bool,
+    ) -> list[tuple[Any, Any, int, bool]]:
+        """Validate and normalize reset mocap payloads into device write plans."""
+        import torch
+
+        if poses is None:
+            return []
+        if not isinstance(poses, Mapping):
+            raise TypeError("mjwarp reset mocap poses must be a mapping")
+        pending: list[tuple[Any, Any, int, bool]] = []
+        for body_name, pair in poses.items():
+            if not isinstance(body_name, str) or not body_name:
+                raise TypeError("mjwarp reset mocap body names must be non-empty strings")
+            if body_name not in self._body_ids:
+                raise KeyError(f"mjwarp mocap body {body_name!r} does not exist")
+            mocap_id = int(self._cpu_model.body_mocapid[self._body_ids[body_name]])
+            if mocap_id < 0:
+                raise NotImplementedError(f"mjwarp body {body_name!r} is not a mocap body")
+            if not isinstance(pair, tuple) or len(pair) != 2:
+                raise TypeError("mjwarp reset mocap values must be (selector, poses) pairs")
+            selector, pose_values = pair
+            if not isinstance(selector, torch.Tensor) or selector.ndim != 1:
+                raise TypeError(
+                    "mjwarp reset mocap selector must be a one-dimensional Torch tensor"
+                )
+            if masked:
+                selector = self._validate_torch_operand(
+                    f"{body_name} mocap reset mask",
+                    selector,
+                    shape=(self._num_envs,),
+                    dtype_name="torch.bool",
+                    check_finite=False,
+                )
+                expected = (self._num_envs, 7)
+            else:
+                selector = self._validate_torch_operand(
+                    f"{body_name} mocap rows",
+                    selector,
+                    shape=(int(selector.shape[0]),),
+                    dtype_name="torch.int64",
+                    check_finite=False,
+                )
+                if selector.shape[0]:
+                    validation.append(
+                        (
+                            f"{body_name} mocap rows",
+                            "rows",
+                            selector,
+                            self._torch_rows_flag(selector),
+                        )
+                    )
+                expected = (int(selector.shape[0]), 7)
+            values = self._validate_torch_operand(
+                f"{body_name} mocap poses",
+                pose_values,
+                shape=expected,
+                check_finite=False,
+            )
+            quat_norm = values[:, 3:].norm(dim=-1, keepdim=True)
+            validation.append(
+                (
+                    f"{body_name} mocap poses",
+                    "finite",
+                    values,
+                    self._torch_value_flag("finite", values),
+                )
+            )
+            validation.append(
+                (
+                    f"{body_name} mocap quaternion norm",
+                    "positive",
+                    quat_norm,
+                    self._torch_value_flag("positive", quat_norm),
+                )
+            )
+            normalized = torch.cat((values[:, :3], values[:, 3:] / quat_norm), dim=-1).contiguous()
+            pending.append((selector, normalized, mocap_id, masked))
+        return pending
+
+    def _apply_reset_mocap_poses(self, pending: list[tuple[Any, Any, int, bool]]) -> None:
+        """Apply already-validated mocap reset values before the reset forward."""
+        import torch
+
+        if not pending:
+            return
+        positions = self._torch_view(self._device_data.mocap_pos, require_contiguous=False)
+        quaternions = self._torch_view(self._device_data.mocap_quat, require_contiguous=False)
+        for selector, values, mocap_id, masked in pending:
+            if masked:
+                current_position = positions[:, mocap_id]
+                current_quaternion = quaternions[:, mocap_id]
+                current_position.copy_(
+                    torch.where(selector[:, None], values[:, :3], current_position)
+                )
+                current_quaternion.copy_(
+                    torch.where(selector[:, None], values[:, 3:], current_quaternion)
+                )
+            else:
+                positions[selector, mocap_id] = values[:, :3]
+                quaternions[selector, mocap_id] = values[:, 3:]
 
     def _disable_cuda_graphs(self, reason: str) -> None:
         """Atomically select the eager path and release any captured graphs."""
@@ -2143,6 +2394,490 @@ class MjwarpBackend(SimBackend):
             tracked_body_views=True,
             mask_selected_reset=True,
             mask_selected_reset_full_refresh=True,
+            frame_read_plan=True,
+            site_pose_views=True,
+            site_jacobian_views=True,
+            site_state_kinematics=self._fixed_variant_plan is None,
+            deferred_finite_validation=True,
+            generalized_force_injection=True,
+            packed_reset_mocap=True,
+        )
+
+    def bind_tensor_read_plan(self, spec: TensorIOSpec) -> TensorReadPlan:
+        """Bind a cold state/sensor/site read set to this exact CUDA device."""
+        import torch
+
+        if not isinstance(spec, TensorIOSpec):
+            raise TypeError("mjwarp tensor read plan requires a TensorIOSpec")
+        if spec.device is not None:
+            requested = torch.device(spec.device)
+            reference = self._torch_view(self._device_data.qpos).device
+            if requested != reference:
+                raise ValueError(
+                    f"mjwarp tensor read plan must use {reference}, requested {requested}"
+                )
+        missing_state = set(spec.state_fields) - {"qpos", "qvel", "ctrl", "sensordata", "time"}
+        if missing_state:
+            raise KeyError(f"unknown mjwarp tensor read fields: {sorted(missing_state)}")
+        unknown_sensors = set(spec.sensor_names) - set(self._sensor_slots)
+        if unknown_sensors:
+            raise KeyError(f"unknown mjwarp tensor sensors: {sorted(unknown_sensors)}")
+        for name in (*spec.site_names, *spec.jacobian_site_names):
+            if name not in self._site_ids:
+                raise ValueError(f"site {name!r} not found in mjwarp model")
+        reference = self._validate_tensor_device(spec.device, "tensor read plan")
+        if spec.site_names:
+            self._site_pose_index_tensor(tuple(spec.site_names), device=reference)
+        for name in spec.jacobian_site_names:
+            self._site_dof_mask(name, reference)
+        if spec.jacobian_site_names:
+            self._dof_root_index_tensor(reference)
+        if spec.body_names and not self._tracked_body_names:
+            raise NotImplementedError("mjwarp tensor read plan requires tracked-body views")
+        if spec.body_names:
+            self._ordered_tracked_body_columns(spec.body_names)
+        return TensorReadPlan(self, spec)
+
+    def get_sensor_views(
+        self, names: Sequence[str], device: Any | None = None
+    ) -> Mapping[str, Any]:
+        """Read multiple sensors after one shared tracked-state freshness check."""
+        requested = tuple(names)
+        if isinstance(names, (str, bytes)) or len(set(requested)) != len(requested):
+            raise ValueError("sensor names must be a sequence of unique names")
+        unknown = set(requested) - set(self._sensor_slots)
+        if unknown:
+            raise KeyError(f"unknown mjwarp tensor sensors: {sorted(unknown)}")
+        if (
+            any(name in self._tracked_sensor_names for name in requested)
+            and self._tracked_body_state_dirty
+        ):
+            self._refresh_tracked_body_state_device_only()
+        return {name: self.get_sensor_view(name, device=device) for name in requested}
+
+    def _validate_tensor_device(self, device: Any | None, label: str) -> Any:
+        import torch
+
+        reference = self._torch_view(self._device_data.qpos).device
+        if device is not None and torch.device(device) != reference:
+            raise ValueError(f"mjwarp {label} must live on {reference}, requested {device}")
+        return reference
+
+    @staticmethod
+    def _site_matrix_quaternion(matrix: Any) -> Any:
+        """Vectorized, normalized matrix-to-wxyz conversion without host branches."""
+        import torch
+
+        m00, m11, m22 = matrix[..., 0, 0], matrix[..., 1, 1], matrix[..., 2, 2]
+        q_abs = torch.sqrt(
+            torch.clamp(
+                torch.stack(
+                    (
+                        1.0 + m00 + m11 + m22,
+                        1.0 + m00 - m11 - m22,
+                        1.0 - m00 + m11 - m22,
+                        1.0 - m00 - m11 + m22,
+                    ),
+                    dim=-1,
+                ),
+                min=0.0,
+            )
+        )
+        candidates = torch.stack(
+            (
+                torch.stack(
+                    (
+                        q_abs[..., 0] ** 2,
+                        matrix[..., 2, 1] - matrix[..., 1, 2],
+                        matrix[..., 0, 2] - matrix[..., 2, 0],
+                        matrix[..., 1, 0] - matrix[..., 0, 1],
+                    ),
+                    dim=-1,
+                ),
+                torch.stack(
+                    (
+                        matrix[..., 2, 1] - matrix[..., 1, 2],
+                        q_abs[..., 1] ** 2,
+                        matrix[..., 1, 0] + matrix[..., 0, 1],
+                        matrix[..., 0, 2] + matrix[..., 2, 0],
+                    ),
+                    dim=-1,
+                ),
+                torch.stack(
+                    (
+                        matrix[..., 0, 2] - matrix[..., 2, 0],
+                        matrix[..., 1, 0] + matrix[..., 0, 1],
+                        q_abs[..., 2] ** 2,
+                        matrix[..., 2, 1] + matrix[..., 1, 2],
+                    ),
+                    dim=-1,
+                ),
+                torch.stack(
+                    (
+                        matrix[..., 1, 0] - matrix[..., 0, 1],
+                        matrix[..., 0, 2] + matrix[..., 2, 0],
+                        matrix[..., 2, 1] + matrix[..., 1, 2],
+                        q_abs[..., 3] ** 2,
+                    ),
+                    dim=-1,
+                ),
+            ),
+            dim=-2,
+        )
+        denominator = (2.0 * q_abs).clamp_min(torch.finfo(matrix.dtype).eps)
+        candidates = candidates / denominator[..., :, None]
+        choice = q_abs.argmax(dim=-1)
+        gather_index = choice[..., None, None].expand(*choice.shape, 1, 4)
+        quat = candidates.gather(-2, gather_index).squeeze(-2)
+        return quat / quat.norm(dim=-1, keepdim=True).clamp_min(torch.finfo(matrix.dtype).eps)
+
+    def get_site_pose_tensor(
+        self, names: Sequence[str], device: Any | None = None
+    ) -> TensorSitePoseViews:
+        """Return stable batched site position and wxyz quaternion tensors."""
+        import torch
+
+        self._require_entity_healthy()
+        reference = self._validate_tensor_device(device, "site pose")
+        if self._tracked_body_state_dirty:
+            self._refresh_tracked_body_state_device_only()
+        if isinstance(names, (str, bytes)):
+            raise TypeError("site names must be a sequence of strings")
+        site_names = tuple(names)
+        if not site_names or any(not isinstance(name, str) or not name for name in site_names):
+            raise ValueError("site names must be non-empty")
+        if len(set(site_names)) != len(site_names):
+            raise ValueError("site names must be unique")
+        try:
+            ids = tuple(self._site_ids[name] for name in site_names)
+        except KeyError as exc:
+            raise ValueError(f"site {exc.args[0]!r} not found in mjwarp model") from exc
+        key = site_names
+        cached = self._site_pose_torch_views.get(key)
+        if cached is None:
+            cached = (
+                torch.empty((self._num_envs, len(ids), 3), dtype=torch.float32, device=reference),
+                torch.empty((self._num_envs, len(ids), 4), dtype=torch.float32, device=reference),
+            )
+            self._site_pose_torch_views[key] = cached
+        pos_out, quat_out = cached
+        pos = self._torch_view(self._device_data.site_xpos, require_contiguous=False)
+        matrix = self._torch_view(self._device_data.site_xmat, require_contiguous=False)
+        index = self._site_pose_index_tensor(site_names, device=reference)
+        pos_out.copy_(pos.index_select(1, index))
+        quat_out.copy_(self._site_matrix_quaternion(matrix.index_select(1, index)))
+        return TensorSitePoseViews(site_names, pos_out, quat_out)
+
+    def _site_dof_mask(self, site_name: str, device: Any) -> Any:
+        import torch
+
+        mask = self._site_dof_masks.get(site_name)
+        if mask is None or mask.device != device:
+            site_id = self._site_ids[site_name]
+            body_id = int(self._cpu_model.site_bodyid[site_id])
+            ancestors: set[int] = set()
+            current = body_id
+            while current > 0:
+                ancestors.add(current)
+                current = int(self._cpu_model.body_parentid[current])
+            dof_body = np.asarray(self._cpu_model.dof_bodyid, dtype=np.int64)
+            mask_np = np.asarray([int(body) in ancestors for body in dof_body], dtype=np.bool_)
+            mask = torch.as_tensor(mask_np, dtype=torch.bool, device=device)
+            self._site_dof_masks[site_name] = mask
+        return mask
+
+    def _site_pose_index_tensor(self, site_names: tuple[str, ...], device: Any) -> Any:
+        import torch
+
+        index = self._site_pose_indices.get(site_names)
+        if index is None or index.device != torch.device(device):
+            ids = tuple(self._site_ids[name] for name in site_names)
+            index = torch.tensor(ids, dtype=torch.long, device=device)
+            self._site_pose_indices[site_names] = index
+        return index
+
+    def _site_jacobian_index_tensor(self, dof_indices: tuple[int, ...], device: Any) -> Any:
+        import torch
+
+        index = self._site_jacobian_indices.get(dof_indices)
+        if index is None or index.device != torch.device(device):
+            index = torch.tensor(dof_indices, dtype=torch.long, device=device)
+            self._site_jacobian_indices[dof_indices] = index
+        return index
+
+    def _dof_root_index_tensor(self, device: Any) -> Any:
+        import torch
+
+        if self._dof_root_indices is None or self._dof_root_indices.device != torch.device(device):
+            dof_body = np.asarray(self._cpu_model.dof_bodyid, dtype=np.int64)
+            roots = np.asarray(self._cpu_model.body_rootid[dof_body], dtype=np.int64)
+            self._dof_root_indices = torch.as_tensor(roots, dtype=torch.long, device=device)
+        return self._dof_root_indices
+
+    def prepare_site_jacobian(self, site_name: str, dof_indices: Sequence[int]) -> None:
+        """Cache immutable device selectors for a steady-state Jacobian query."""
+        reference = self._validate_tensor_device(None, "site Jacobian selector")
+        if site_name not in self._site_ids:
+            raise ValueError(f"site {site_name!r} not found in mjwarp model")
+        dof_tuple = tuple(int(index) for index in dof_indices)
+        if not dof_tuple or len(set(dof_tuple)) != len(dof_tuple):
+            raise ValueError("site Jacobian dof_indices must be non-empty and unique")
+        if any(index < 0 or index >= self._nv for index in dof_tuple):
+            raise IndexError("site Jacobian DoF is outside [0, nv)")
+        self._site_jacobian_index_tensor(dof_tuple, reference)
+        self._dof_root_index_tensor(reference)
+        self._site_dof_mask(site_name, reference)
+
+    def get_site_jacobian_tensor(
+        self,
+        site_name: str,
+        dof_indices: Sequence[int] | Any | None = None,
+        device: Any | None = None,
+    ) -> TensorSiteJacobianViews:
+        """Return device-computed world-frame site Jacobians for selected DoFs."""
+        import torch
+
+        self._require_entity_healthy()
+        reference = self._validate_tensor_device(device, "site Jacobian")
+        if self._tracked_body_state_dirty:
+            self._refresh_tracked_body_state_device_only()
+        if site_name not in self._site_ids:
+            raise ValueError(f"site {site_name!r} not found in mjwarp model")
+        if isinstance(dof_indices, torch.Tensor):
+            raise TypeError("site Jacobian DoF indices are static metadata; pass a Python sequence")
+        elif dof_indices is None:
+            dof_tuple = tuple(range(self._nv))
+            index = self._site_jacobian_index_tensor(dof_tuple, reference)
+        else:
+            dof_tuple = tuple(int(item) for item in dof_indices)
+            if not dof_tuple or len(set(dof_tuple)) != len(dof_tuple):
+                raise ValueError("site Jacobian dof_indices must be non-empty and unique")
+            if any(item < 0 or item >= self._nv for item in dof_tuple):
+                raise IndexError("site Jacobian DoF index is outside [0, nv)")
+            index = self._site_jacobian_index_tensor(dof_tuple, reference)
+        key = (site_name, dof_tuple)
+        outputs = self._site_jacobian_torch_views.get(key)
+        if outputs is None:
+            shape = (self._num_envs, 3, len(dof_tuple))
+            outputs = (
+                torch.empty(shape, dtype=torch.float32, device=reference),
+                torch.empty(shape, dtype=torch.float32, device=reference),
+            )
+            self._site_jacobian_torch_views[key] = outputs
+        jacp_out, jacr_out = outputs
+        site_id = self._site_ids[site_name]
+        pos = self._torch_view(self._device_data.site_xpos, require_contiguous=False)[:, site_id]
+        cdof = self._torch_view(self._device_data.cdof, require_contiguous=False)
+        subtree_com = self._torch_view(self._device_data.subtree_com, require_contiguous=False)
+        root_index = self._dof_root_index_tensor(reference)
+        com = subtree_com.index_select(1, root_index)
+        angular = cdof[..., :3]
+        linear = cdof[..., 3:] + torch.cross(angular, pos[:, None, :] - com, dim=-1)
+        mask = self._site_dof_mask(site_name, reference)
+        angular = angular * mask[None, :, None]
+        linear = linear * mask[None, :, None]
+        jacr_out.copy_(angular.index_select(1, index).transpose(1, 2))
+        jacp_out.copy_(linear.index_select(1, index).transpose(1, 2))
+        return TensorSiteJacobianViews(site_name, dof_tuple, jacp_out, jacr_out)
+
+    def _state_kinematics_scratch(self) -> tuple[Any, int]:
+        """Return bounded scratch Data for non-mutating reset kinematics."""
+        if self._reset_scratch_data is not None:
+            return self._reset_scratch_data, self._reset_scratch_capacity
+        if self._state_kinematics_scratch_data is None:
+            capacity = min(self._num_envs, 64)
+            if capacity <= 0:
+                raise RuntimeError("state-conditioned kinematics requires a non-empty batch")
+            with self._warp.ScopedDevice(self._warp.get_device()):
+                self._state_kinematics_scratch_data = self._mujoco_warp.make_data(
+                    self._cpu_model,
+                    nworld=capacity,
+                    nconmax=self._nconmax,
+                    njmax=self._njmax,
+                )
+            self._state_kinematics_scratch_capacity = capacity
+        return self._state_kinematics_scratch_data, self._state_kinematics_scratch_capacity
+
+    def get_site_kinematics_for_state_tensor(
+        self,
+        site_name: str,
+        env_indices: Any,
+        qpos: Any,
+        dof_indices: Sequence[int],
+        device: Any | None = None,
+        *,
+        mocap_poses: Mapping[str, Any] | None = None,
+    ) -> TensorSiteKinematicsViews:
+        """Evaluate candidate reset state kinematics without mutating live Data."""
+        import torch
+
+        self._require_entity_healthy()
+        if self._fixed_variant_plan is not None:
+            raise NotImplementedError(
+                "state-conditioned reset kinematics is unavailable with per-world model variants"
+            )
+        reference = self._validate_tensor_device(device, "state-conditioned site kinematics")
+        if site_name not in self._site_ids:
+            raise ValueError(f"site {site_name!r} not found in mjwarp model")
+        if not isinstance(env_indices, torch.Tensor) or env_indices.ndim != 1:
+            raise TypeError("state-conditioned env_indices must be a 1-D int64 Torch tensor")
+        rows = self._validate_torch_operand(
+            "state-conditioned env_indices",
+            env_indices,
+            shape=(int(env_indices.shape[0]),),
+            dtype_name="torch.int64",
+            check_finite=False,
+        )
+        if not rows.is_contiguous():
+            raise ValueError("state-conditioned env_indices must be contiguous")
+        if rows.numel():
+            rows_valid = torch.all((rows >= 0) & (rows < self._num_envs))
+            if callable(getattr(torch, "_assert_async", None)):
+                torch._assert_async(rows_valid, "state-conditioned row is outside the batch")
+            else:
+                self._validate_torch_fused(
+                    [("state-conditioned env_indices", "rows", rows, rows_valid)]
+                )
+        qpos_tensor = self._validate_torch_operand(
+            "state-conditioned qpos",
+            qpos,
+            shape=(rows.shape[0], self._nq),
+            check_finite=False,
+        )
+        mocap_overrides: dict[int, tuple[Any, Any]] = {}
+        mocap_verdicts = []
+        if mocap_poses is not None:
+            if not isinstance(mocap_poses, Mapping):
+                raise TypeError("state-conditioned mocap_poses must be a body-to-pose mapping")
+            for body_name, pose_values in mocap_poses.items():
+                if not isinstance(body_name, str) or not body_name:
+                    raise TypeError("state-conditioned mocap body names must be non-empty strings")
+                if body_name not in self._body_ids:
+                    raise KeyError(f"state-conditioned mocap body {body_name!r} does not exist")
+                mocap_id = int(self._cpu_model.body_mocapid[self._body_ids[body_name]])
+                if mocap_id < 0:
+                    raise NotImplementedError(
+                        f"state-conditioned body {body_name!r} is not a mocap body"
+                    )
+                poses = self._validate_torch_operand(
+                    f"state-conditioned mocap poses for {body_name}",
+                    pose_values,
+                    shape=(rows.shape[0], 7),
+                    dtype_name="torch.float32",
+                    check_finite=False,
+                )
+                quat_norm = poses[:, 3:].norm(dim=-1)
+                mocap_verdicts.append(
+                    torch.isfinite(poses).all()
+                    & torch.isfinite(quat_norm).all()
+                    & (quat_norm > 1.0e-12).all()
+                )
+                mocap_overrides[mocap_id] = (
+                    poses[:, :3],
+                    poses[:, 3:] / quat_norm[:, None].clamp_min(1.0e-12),
+                )
+        if mocap_verdicts:
+            mocap_verdict = torch.stack(mocap_verdicts).all()
+            if self._defer_tensor_finite_validation:
+                if self._pending_tensor_finite_verdict is None:
+                    self._pending_tensor_finite_verdict = mocap_verdict
+                else:
+                    self._pending_tensor_finite_verdict.logical_and_(mocap_verdict)
+            else:
+                if reference.type == "cuda":
+                    self._tensor_scalar_sync_count += 1
+                if not bool(mocap_verdict):
+                    raise ValueError(
+                        "state-conditioned mocap poses must be finite with nonzero quaternions"
+                    )
+        dof_tuple = tuple(int(index) for index in dof_indices)
+        if not dof_tuple or len(set(dof_tuple)) != len(dof_tuple):
+            raise ValueError("state-conditioned dof_indices must be non-empty and unique")
+        if any(index < 0 or index >= self._nv for index in dof_tuple):
+            raise IndexError("state-conditioned DoF is outside [0, nv)")
+        key = (site_name, dof_tuple, rows.shape[0])
+        outputs = self._site_state_kinematics_views.get(key)
+        if outputs is None:
+            outputs = (
+                torch.empty((rows.shape[0], 3), dtype=torch.float32, device=reference),
+                torch.empty((rows.shape[0], 4), dtype=torch.float32, device=reference),
+                torch.empty(
+                    (rows.shape[0], 3, len(dof_tuple)), dtype=torch.float32, device=reference
+                ),
+                torch.empty(
+                    (rows.shape[0], 3, len(dof_tuple)), dtype=torch.float32, device=reference
+                ),
+            )
+            self._site_state_kinematics_views[key] = outputs
+        pos_out, quat_out, jacp_out, jacr_out = outputs
+        if rows.numel() == 0:
+            return TensorSiteKinematicsViews(
+                site_name, rows, dof_tuple, pos_out, quat_out, jacp_out, jacr_out
+            )
+
+        data, capacity = self._state_kinematics_scratch()
+        site_id = self._site_ids[site_name]
+        dof_index = self._site_jacobian_index_tensor(dof_tuple, reference)
+        root_index = self._dof_root_index_tensor(reference)
+        dof_mask = self._site_dof_mask(site_name, reference)
+        live_mocap_pos = self._torch_view(self._device_data.mocap_pos, require_contiguous=False)
+        live_mocap_quat = self._torch_view(self._device_data.mocap_quat, require_contiguous=False)
+        current_stream = torch.cuda.current_stream(reference)
+        warp_stream = self._torch_execution_stream(reference)
+        site_xpos = self._torch_view(data.site_xpos, require_contiguous=False)
+        site_xmat = self._torch_view(data.site_xmat, require_contiguous=False)
+        cdof = self._torch_view(data.cdof, require_contiguous=False)
+        subtree_com = self._torch_view(data.subtree_com, require_contiguous=False)
+
+        for start in range(0, rows.shape[0], capacity):
+            stop = min(start + capacity, rows.shape[0])
+            selected_rows = rows[start:stop]
+            selected_qpos = qpos_tensor[start:stop].contiguous()
+            selected_mocap_pos = live_mocap_pos.index_select(0, selected_rows).contiguous()
+            selected_mocap_quat = live_mocap_quat.index_select(0, selected_rows).contiguous()
+            for mocap_id, (override_pos, override_quat) in mocap_overrides.items():
+                selected_mocap_pos[:, mocap_id].copy_(override_pos[start:stop])
+                selected_mocap_quat[:, mocap_id].copy_(override_quat[start:stop])
+            input_ready = torch.cuda.Event()
+            input_ready.record(current_stream)
+            warp_stream.wait_event(input_ready)
+            with self._warp.ScopedDevice(self._warp.get_device()):
+                self._warp.copy(data.qpos[: stop - start], self._warp.from_torch(selected_qpos))
+                if self._nmocap:
+                    self._warp.copy(
+                        data.mocap_pos[: stop - start],
+                        self._warp.from_torch(selected_mocap_pos, dtype=self._warp.vec3),
+                    )
+                    self._warp.copy(
+                        data.mocap_quat[: stop - start],
+                        self._warp.from_torch(selected_mocap_quat, dtype=self._warp.vec4),
+                    )
+                self._mujoco_warp.kinematics(self._device_model, data)
+                self._mujoco_warp.com_pos(self._device_model, data)
+            kinematics_ready = torch.cuda.Event()
+            kinematics_ready.record(warp_stream)
+            current_stream.wait_event(kinematics_ready)
+
+            batch_pos = site_xpos[: stop - start, site_id]
+            batch_quat = self._site_matrix_quaternion(site_xmat[: stop - start, site_id])
+            batch_cdof = cdof[: stop - start]
+            batch_com = subtree_com[: stop - start].index_select(1, root_index)
+            angular = batch_cdof[..., :3]
+            linear = batch_cdof[..., 3:] + torch.cross(
+                angular, batch_pos[:, None, :] - batch_com, dim=-1
+            )
+            angular = angular * dof_mask[None, :, None]
+            linear = linear * dof_mask[None, :, None]
+            pos_out[start:stop].copy_(batch_pos)
+            quat_out[start:stop].copy_(batch_quat)
+            jacp_out[start:stop].copy_(linear.index_select(1, dof_index).transpose(1, 2))
+            jacr_out[start:stop].copy_(angular.index_select(1, dof_index).transpose(1, 2))
+            output_consumed = torch.cuda.Event()
+            output_consumed.record(current_stream)
+            warp_stream.wait_event(output_consumed)
+
+        return TensorSiteKinematicsViews(
+            site_name, rows, dof_tuple, pos_out, quat_out, jacp_out, jacr_out
         )
 
     def bind_packed_reset(self, *, device: Any | None = None) -> Any:
@@ -2166,6 +2901,13 @@ class MjwarpBackend(SimBackend):
     def get_tensor_runtime_diagnostics(self) -> dict[str, TensorRuntimeDiagnostic]:
         """Expose whether fixed-address MJWarp graph replay is active."""
         return {
+            "geom_collision_overrides": TensorRuntimeDiagnostic(
+                requested=bool(self._geom_collision_overrides),
+                enabled=bool(self._geom_collision_overrides),
+                disable_reason=(
+                    None if self._geom_collision_overrides else "no collision overrides requested"
+                ),
+            ),
             "cuda_graph": TensorRuntimeDiagnostic(
                 requested=True,
                 enabled=bool(self._cuda_graph_enabled),
@@ -2180,6 +2922,40 @@ class MjwarpBackend(SimBackend):
                 requested=True,
                 enabled=True,
                 disable_reason=None,
+            ),
+            "tensor_frame_read_plan": TensorRuntimeDiagnostic(
+                requested=True,
+                enabled=True,
+                disable_reason=None,
+            ),
+            "tensor_site_pose_views": TensorRuntimeDiagnostic(
+                requested=True,
+                enabled=True,
+                disable_reason=None,
+            ),
+            "tensor_site_jacobian_views": TensorRuntimeDiagnostic(
+                requested=True,
+                enabled=True,
+                disable_reason=None,
+            ),
+            "tensor_generalized_force_injection": TensorRuntimeDiagnostic(
+                requested=True,
+                enabled=True,
+                disable_reason=None,
+            ),
+            "tensor_mocap_pose_write": TensorRuntimeDiagnostic(
+                requested=True,
+                enabled=True,
+                disable_reason=None,
+            ),
+            "ccd_margin_compatibility": TensorRuntimeDiagnostic(
+                requested=bool(self._ccd_disabled_for_margin),
+                enabled=bool(self._ccd_disabled_for_margin),
+                disable_reason=(
+                    None
+                    if self._ccd_disabled_for_margin
+                    else "CCD margin compatibility is not active"
+                ),
             ),
         }
 
@@ -2304,6 +3080,10 @@ class MjwarpBackend(SimBackend):
             ang_vel_w=tensor_block("track_angvel_w", 3)[:, columns],
         )
 
+    def prepare_tracked_body_views(self, body_names: Sequence[str]) -> None:
+        """Cache an immutable tracked-body column selector during setup."""
+        self._ordered_tracked_body_columns(tuple(body_names))
+
     def _ordered_tracked_body_columns(
         self, body_names: Sequence[str] | None
     ) -> tuple[tuple[str, ...], Any]:
@@ -2327,8 +3107,13 @@ class MjwarpBackend(SimBackend):
                 f"tracked-body views requested bodies missing from the tracked namespace: "
                 f"{missing}; available={list(declared)}"
             )
+        cached = self._tracked_body_column_cache.get(names)
+        if cached is not None:
+            return names, cached
         index = {name: position for position, name in enumerate(declared)}
-        return names, torch.tensor([index[name] for name in names], device=reference.device)
+        columns = torch.tensor([index[name] for name in names], device=reference.device)
+        self._tracked_body_column_cache[names] = columns
+        return names, columns
 
     def get_root_state_layout(self, root_body_name: str) -> RootStateLayout:
         if self._entity_layout is not None:
@@ -2748,7 +3533,9 @@ class MjwarpBackend(SimBackend):
             "ctrl",
             ctrl,
             shape=(self._num_envs, self._nu),
+            check_finite=False,
         )
+        self._stage_tensor_finite_verdict(ctrl_tensor, name="ctrl")
 
         t0 = time.perf_counter()
         # The caller owns the public action tensor and cannot mutate it until
@@ -2789,6 +3576,220 @@ class MjwarpBackend(SimBackend):
                 "tensor_step_async": 0.0,
             },
         }
+
+    def set_generalized_force_tensor(
+        self,
+        *,
+        joint_f: Any | None = None,
+        body_f: Any | None = None,
+    ) -> None:
+        """Write persistent generalized forces directly into MJWarp device data."""
+        import torch
+
+        if joint_f is None and body_f is None:
+            raise ValueError("at least one of joint_f or body_f must be provided")
+        if joint_f is not None:
+            target = self._stable_tensor_field_view("qfrc_applied")
+            values = self._validate_torch_operand(
+                "joint_f", joint_f, shape=(self._num_envs, self._nv), check_finite=False
+            )
+            self._stage_tensor_finite_verdict(values, name="joint_f")
+            joint_force = self._tensor_generalized_joint_force
+            if joint_force is None:
+                joint_force = torch.empty_like(target)
+                self._tensor_generalized_joint_force = joint_force
+            joint_force.copy_(values, non_blocking=True)
+            target.copy_(values, non_blocking=True)
+        if body_f is not None:
+            target = self._stable_tensor_field_view("xfrc_applied")
+            values = self._validate_torch_operand(
+                "body_f", body_f, shape=(self._num_envs, self._nbody, 6), check_finite=False
+            )
+            self._stage_tensor_finite_verdict(values, name="body_f")
+            body_force = self._tensor_generalized_body_force
+            if body_force is None:
+                body_force = torch.empty_like(target)
+                self._tensor_generalized_body_force = body_force
+            body_force.copy_(values, non_blocking=True)
+            target.copy_(values, non_blocking=True)
+            self._xfrc_pending = False
+            self._device_xfrc_pending = False
+        self._host_cache_stale = True
+
+    def _restore_tensor_generalized_forces(
+        self, *, rows: Any | None = None, mask: Any | None = None
+    ) -> None:
+        """Restore persistent force inputs for reset rows after reset-data clears."""
+        import torch
+
+        if (rows is None) == (mask is None):
+            raise ValueError("exactly one of rows or mask must be provided")
+        for field, source in (
+            ("qfrc_applied", self._tensor_generalized_joint_force),
+            ("xfrc_applied", self._tensor_generalized_body_force),
+        ):
+            if source is None:
+                continue
+            target = self._stable_tensor_field_view(field)
+            if mask is not None:
+                selector = mask.reshape((self._num_envs,) + (1,) * (target.ndim - 1))
+                torch.where(selector, source, target, out=target)
+            elif rows is not None and rows.numel():
+                target.index_copy_(0, rows, source.index_select(0, rows))
+
+    def set_mocap_pose_tensor(self, body_name: str, env_indices: Any, poses: Any) -> None:
+        """Write one selected mocap pose on CUDA and publish fresh kinematics."""
+        self.set_mocap_poses_tensor({body_name: (env_indices, poses)})
+
+    def set_mocap_poses_tensor(self, poses: Mapping[str, tuple[Any, Any]]) -> None:
+        """Write selected mocap poses and forward once on the current stream."""
+        import torch
+
+        self._require_entity_healthy()
+        if not isinstance(poses, Mapping):
+            raise TypeError("mjwarp mocap poses must be a mapping")
+        if not poses:
+            return
+        reference = self._validate_tensor_device(None, "mocap pose")
+        positions = self._torch_view(self._device_data.mocap_pos, require_contiguous=False)
+        quaternions = self._torch_view(self._device_data.mocap_quat, require_contiguous=False)
+        pending: list[tuple[Any, Any, Any, Any]] = []
+        verdicts = []
+        for body_name, pair in poses.items():
+            if not isinstance(body_name, str) or not body_name:
+                raise TypeError("mjwarp mocap body names must be non-empty strings")
+            if body_name not in self._body_ids:
+                raise KeyError(f"mjwarp mocap body {body_name!r} does not exist")
+            mocap_id = int(self._cpu_model.body_mocapid[self._body_ids[body_name]])
+            if mocap_id < 0:
+                raise NotImplementedError(f"mjwarp body {body_name!r} is not a mocap body")
+            if not isinstance(pair, tuple) or len(pair) != 2:
+                raise TypeError("mjwarp mocap values must be (rows, poses) pairs")
+            rows, pose_values = pair
+            if not isinstance(rows, torch.Tensor):
+                raise TypeError("mjwarp mocap rows must be a Torch tensor")
+            if (
+                rows.device != reference
+                or rows.ndim != 1
+                or rows.dtype != torch.int64
+                or not rows.is_contiguous()
+            ):
+                raise TypeError(f"mjwarp mocap rows must be contiguous 1-D int64 on {reference}")
+            if rows.numel() == 0:
+                continue
+            values = self._validate_torch_operand(
+                "mocap poses",
+                pose_values,
+                shape=(rows.shape[0], 7),
+                check_finite=False,
+            )
+            sorted_rows = rows.sort().values
+            rows_valid = (sorted_rows[0] >= 0) & (sorted_rows[-1] < self._num_envs)
+            if rows.shape[0] > 1:
+                rows_valid = rows_valid & (sorted_rows[1:] != sorted_rows[:-1]).all()
+            quat_norm = values[:, 3:].norm(dim=-1)
+            values_valid = (
+                torch.isfinite(values).all()
+                & torch.isfinite(quat_norm).all()
+                & (quat_norm > 1.0e-12).all()
+            )
+            verdicts.append(rows_valid & values_valid)
+            pending.append((rows, values, quat_norm, mocap_id))
+        if not pending:
+            return
+        verdict = torch.stack(verdicts).all()
+        if self._defer_tensor_finite_validation:
+            if self._pending_tensor_finite_verdict is None:
+                self._pending_tensor_finite_verdict = verdict
+            else:
+                self._pending_tensor_finite_verdict.logical_and_(verdict)
+        else:
+            if reference.type == "cuda":
+                self._tensor_scalar_sync_count += 1
+            if not bool(verdict):
+                raise ValueError(
+                    "mjwarp mocap rows must be unique and in range; poses must be finite "
+                    "with nonzero quaternions"
+                )
+        for rows, values, quat_norm, mocap_id in pending:
+            positions[rows, mocap_id] = values[:, :3]
+            quaternions[rows, mocap_id] = values[:, 3:] / quat_norm[:, None]
+        try:
+            self._execute_device_forward()
+            self._synchronize()
+        except BaseException:
+            self._entity_faulted = True
+            raise
+        self._tracked_body_state_dirty = bool(self._tracked_body_names)
+        self._host_cache_stale = True
+
+    def set_mocap_poses_tensor_mask(self, poses: Mapping[str, tuple[Any, Any]]) -> None:
+        """Write full-width mocap poses selected by fixed-width CUDA masks."""
+        import torch
+
+        self._require_entity_healthy()
+        if not isinstance(poses, Mapping):
+            raise TypeError("mjwarp mocap mask poses must be a mapping")
+        if not poses:
+            return
+        reference = self._validate_tensor_device(None, "mocap pose mask")
+        positions = self._torch_view(self._device_data.mocap_pos, require_contiguous=False)
+        quaternions = self._torch_view(self._device_data.mocap_quat, require_contiguous=False)
+        pending: list[tuple[Any, Any, Any, Any, Any]] = []
+        verdicts = []
+        for body_name, pair in poses.items():
+            if not isinstance(body_name, str) or not body_name:
+                raise TypeError("mjwarp mocap body names must be non-empty strings")
+            if body_name not in self._body_ids:
+                raise KeyError(f"mjwarp mocap body {body_name!r} does not exist")
+            mocap_id = int(self._cpu_model.body_mocapid[self._body_ids[body_name]])
+            if mocap_id < 0:
+                raise NotImplementedError(f"mjwarp body {body_name!r} is not a mocap body")
+            if not isinstance(pair, tuple) or len(pair) != 2:
+                raise TypeError("mjwarp mocap mask values must be (mask, poses) pairs")
+            mask, pose_values = pair
+            mask = self._validate_torch_operand(
+                "mocap reset mask",
+                mask,
+                shape=(self._num_envs,),
+                dtype_name="torch.bool",
+                check_finite=False,
+            )
+            values = self._validate_torch_operand(
+                "mocap poses", pose_values, shape=(self._num_envs, 7), check_finite=False
+            )
+            quat_norm = values[:, 3:].norm(dim=-1)
+            verdicts.append(
+                torch.isfinite(values).all()
+                & torch.isfinite(quat_norm).all()
+                & (quat_norm > 1.0e-12).all()
+            )
+            pending.append((mask, values, quat_norm, mocap_id, positions[:, mocap_id]))
+        verdict = torch.stack(verdicts).all()
+        if self._defer_tensor_finite_validation:
+            if self._pending_tensor_finite_verdict is None:
+                self._pending_tensor_finite_verdict = verdict
+            else:
+                self._pending_tensor_finite_verdict.logical_and_(verdict)
+        else:
+            if reference.type == "cuda":
+                self._tensor_scalar_sync_count += 1
+            if not bool(verdict):
+                raise ValueError("mjwarp mocap poses must be finite with nonzero quaternions")
+        for mask, values, quat_norm, mocap_id, current_position in pending:
+            current_quaternion = quaternions[:, mocap_id]
+            current_position.copy_(torch.where(mask[:, None], values[:, :3], current_position))
+            current_quaternion.copy_(
+                torch.where(mask[:, None], values[:, 3:] / quat_norm[:, None], current_quaternion)
+            )
+        try:
+            self._execute_device_forward()
+            self._synchronize()
+        except BaseException:
+            self._entity_faulted = True
+            raise
+        self._tracked_body_state_dirty = bool(self._tracked_body_names)
+        self._host_cache_stale = True
 
     # All backends report the same set_state key set for column stability;
     # sub-keys that don't apply to the mjwarp host profile report 0.0.
@@ -2881,6 +3882,8 @@ class MjwarpBackend(SimBackend):
         qpos: Any,
         qvel: Any,
         randomization: TensorResetRandomizationPayload | None = None,
+        *,
+        mocap_poses: Mapping[str, tuple[Any, Any]] | None = None,
     ) -> dict[str, Any]:
         """Commit selected generalized state with device-resident scatter kernels."""
         import torch
@@ -2912,8 +3915,6 @@ class MjwarpBackend(SimBackend):
             raise NotImplementedError(
                 "mjwarp tensor reset does not support pending interval body wrenches"
             )
-        if self._nmocap:
-            raise NotImplementedError("mjwarp tensor reset does not support mocap models")
         if not isinstance(env_indices, torch.Tensor):
             raise TypeError("mjwarp tensor env_indices must be a torch.Tensor")
         if env_indices.ndim != 1:
@@ -2945,6 +3946,7 @@ class MjwarpBackend(SimBackend):
         validation.append(
             ("qvel", "finite", qvel_tensor, self._torch_value_flag("finite", qvel_tensor))
         )
+        mocap_pending = self._prepare_reset_mocap_poses(mocap_poses, validation, masked=False)
         # Device randomization scatters must commit before the reset graph
         # replays; keep the same top-of-reset ordering as the NumPy path.
         model_update_ms = 0.0
@@ -2994,7 +3996,9 @@ class MjwarpBackend(SimBackend):
                 self._stable_tensor_field_view(name).index_copy_(
                     0, rows, values.index_select(0, rows)
                 )
+            self._restore_tensor_generalized_forces(rows=rows)
             self._device_xfrc_pending = False
+            self._apply_reset_mocap_poses(mocap_pending)
             # Derived kinematics/sensor state is refreshed lazily by the first
             # tensor sensor view or host-cache publication.  The task runtime
             # always reads sensors immediately after selected reset, so an
@@ -3003,13 +4007,18 @@ class MjwarpBackend(SimBackend):
             # worlds, so it is only valid while model rows stay uniform; any
             # applied model randomization falls back to the lazy full-model
             # refresh, as documented on _publish_selected_tensor_reset_sensors.
-            if model_randomized or not self._publish_selected_tensor_reset_sensors(rows):
+            if mocap_pending:
+                self._execute_device_forward()
+                self._synchronize()
+                self._tracked_body_state_dirty = False
+            elif model_randomized or not self._publish_selected_tensor_reset_sensors(rows):
                 self._tracked_body_state_dirty = bool(self._tracked_body_names)
         except BaseException:
             self._entity_faulted = True
             raise
         forward_ms = (time.perf_counter() - t0) * 1000.0
         self._host_cache_stale = True
+        self._tensor_reset_commit_count += 1
         return {
             "timing": {
                 "set_state_tensor_mask_ms": reset_ms,
@@ -3027,6 +4036,7 @@ class MjwarpBackend(SimBackend):
         randomization: TensorResetRandomizationPayload | None = None,
         *,
         full_refresh: bool = False,
+        mocap_poses_mask: Mapping[str, tuple[Any, Any]] | None = None,
     ) -> dict[str, Any]:
         """Commit full-width tensors selected by a backend-published bool mask.
 
@@ -3076,6 +4086,7 @@ class MjwarpBackend(SimBackend):
             ("qpos", "finite", qpos_tensor, self._torch_value_flag("finite", qpos_tensor)),
             ("qvel", "finite", qvel_tensor, self._torch_value_flag("finite", qvel_tensor)),
         ]
+        mocap_pending = self._prepare_reset_mocap_poses(mocap_poses_mask, validation, masked=True)
 
         model_update_ms = 0.0
         if randomization is not None:
@@ -3103,6 +4114,12 @@ class MjwarpBackend(SimBackend):
             self._state_torch_views["__reset_mask"] = graph_mask
         graph_mask.copy_(mask_tensor)
         reset_ms = (time.perf_counter() - mask_started) * 1000.0
+        warp_stream = self._torch_execution_stream(mask_tensor.device)
+        mask_ready = torch.cuda.Event()
+        # Event.record()/wait() without an explicit stream use the caller's
+        # current stream. This preserves caller ordering without a stream query.
+        mask_ready.record()
+        warp_stream.wait_event(mask_ready)
         forward_started = time.perf_counter()
         try:
             if self._tensor_reset_defaults is None:
@@ -3111,6 +4128,9 @@ class MjwarpBackend(SimBackend):
                     defaults[name] = torch.zeros_like(self._stable_tensor_field_view(name))
                 self._tensor_reset_defaults = defaults
             self._execute_device_reset()
+            reset_ready = torch.cuda.Event()
+            reset_ready.record(warp_stream)
+            reset_ready.wait()
             stable_qpos = self._stable_tensor_field_view("qpos")
             stable_qvel = self._stable_tensor_field_view("qvel")
             stable_qpos.copy_(torch.where(mask_tensor[:, None], qpos_tensor, stable_qpos))
@@ -3120,7 +4140,16 @@ class MjwarpBackend(SimBackend):
             for name in self._tensor_reset_defaults:
                 current = self._stable_tensor_field_view(name)
                 current.masked_fill_(mask_tensor.reshape(-1, *([1] * (current.ndim - 1))), 0)
+            self._restore_tensor_generalized_forces(mask=mask_tensor)
             self._device_xfrc_pending = False
+            self._apply_reset_mocap_poses(mocap_pending)
+
+            # Order Torch mask/state writes and Warp reset/forward kernels with
+            # CUDA events. This preserves asynchronous reset semantics without
+            # a device-wide host synchronization.
+            state_ready = torch.cuda.Event()
+            state_ready.record()
+            warp_stream.wait_event(state_ready)
 
             # The default publication keeps derived tracked-body state lazy while
             # qpos/qvel/time remain authoritative. It must not materialize rows
@@ -3128,13 +4157,23 @@ class MjwarpBackend(SimBackend):
             # the complete batch instead.
             sensor_refresh_started = time.perf_counter()
             self._tracked_body_state_dirty = bool(self._tracked_body_names)
-            if full_refresh:
+            if mocap_pending:
                 self._execute_device_forward()
+                forward_ready = torch.cuda.Event()
+                forward_ready.record(warp_stream)
+                forward_ready.wait()
+                self._tracked_body_state_dirty = False
+            elif full_refresh:
+                self._execute_device_forward()
+                forward_ready = torch.cuda.Event()
+                forward_ready.record(warp_stream)
+                forward_ready.wait()
                 self._tracked_body_state_dirty = False
             sensor_refresh_ms = (time.perf_counter() - sensor_refresh_started) * 1000.0
         except BaseException:
             self._entity_faulted = True
             raise
+        self._tensor_reset_commit_count += 1
         return {
             "timing": {
                 "set_state_tensor_mask_ms": reset_ms,
@@ -3918,9 +4957,7 @@ class MjwarpBackend(SimBackend):
         zero_force = np.zeros((self._num_envs, len(body_ids), 3), dtype=np.float32)
         self.apply_body_force(body_ids, zero_force, torque=torque)
 
-    def _apply_interval_root_velocity_delta(
-        self, op: IntervalTermOp, *, angular: bool
-    ) -> None:
+    def _apply_interval_root_velocity_delta(self, op: IntervalTermOp, *, angular: bool) -> None:
         body_ids = require_op_body_ids(op)
         if self._interval_value_is_device(op.payload):
             self._apply_device_body_velocity_delta(body_ids, op.payload, angular=angular)
@@ -3964,9 +5001,7 @@ class MjwarpBackend(SimBackend):
         )
         values = delta[:, 0, :]
         if angular:
-            quat_columns = torch.as_tensor(
-                quat_qpos_ids, dtype=torch.int64, device=qvel.device
-            )
+            quat_columns = torch.as_tensor(quat_qpos_ids, dtype=torch.int64, device=qvel.device)
             quat = self._stable_tensor_field_view("qpos")[:, quat_columns]
             values = torch_quat_rotate_inverse(torch, quat, values)
         qvel[:, columns] += values

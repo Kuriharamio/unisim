@@ -4364,10 +4364,14 @@ class MotrixBackend(SimBackend):
         qpos: Any,
         qvel: Any,
         randomization: TensorResetRandomizationPayload | None = None,
+        *,
+        mocap_poses: Any | None = None,
     ) -> dict | None:
         """Bridge selected accelerator reset state to CPU MotrixSim physics."""
         from .tensor import set_state_tensor
 
+        if mocap_poses:
+            raise NotImplementedError("Motrix tensor reset does not support mocap poses")
         return set_state_tensor(self, env_indices, qpos, qvel, randomization)
 
     def set_state_tensor_mask(
@@ -4378,10 +4382,13 @@ class MotrixBackend(SimBackend):
         randomization: TensorResetRandomizationPayload | None = None,
         *,
         full_refresh: bool = False,
+        mocap_poses_mask: Any | None = None,
     ) -> dict | None:
         """Commit full-width accelerator reset state selected by a bool mask."""
         from .tensor import set_state_tensor_mask
 
+        if mocap_poses_mask:
+            raise NotImplementedError("Motrix tensor mask reset does not support mocap poses")
         return set_state_tensor_mask(
             self, reset_mask, qpos, qvel, randomization, full_refresh=full_refresh
         )

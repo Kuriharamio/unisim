@@ -58,7 +58,7 @@ def test_tensor_io_body_request_defaults_and_validation() -> None:
     assert default.body_names == ()
     assert default.body_fields == ()
 
-    with pytest.raises(ValueError, match="state fields, sensors, or bodies"):
+    with pytest.raises(ValueError, match="state fields, sensors, bodies, sites, or Jacobians"):
         TensorIOSpec(state_fields=(), sensor_names=(), body_names=())
     with pytest.raises(ValueError, match="body fields require body_names"):
         TensorIOSpec(sensor_names=("angle",), body_fields=("pos_w",))

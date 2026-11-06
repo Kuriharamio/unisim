@@ -67,8 +67,11 @@ class _ComposerBackend:
             return np.zeros((2, 3), dtype=np.float32)
         raise AssertionError(term)
 
-    def set_state_tensor(self, rows, qpos, qvel, randomization=None):
+    def set_state_tensor(self, rows, qpos, qvel, randomization=None, *, mocap_poses=None):
         self.commits.append((rows, qpos, qvel, randomization))
+        if mocap_poses:
+            for body_name, (mocap_rows, poses) in mocap_poses.items():
+                self.set_mocap_pose_tensor(body_name, mocap_rows, poses)
         return {"timing": {"set_state_tensor_commit_forward_ms": 1.0}}
 
     def set_state_tensor_mask(self, reset_mask, qpos, qvel, randomization=None, **_kwargs):
@@ -77,6 +80,10 @@ class _ComposerBackend:
 
     def set_mocap_pose_tensor(self, body_name, rows, poses):
         self.mocap_writes.append((body_name, rows, poses))
+
+    def set_mocap_poses_tensor(self, poses):
+        for body_name, (rows, values) in poses.items():
+            self.set_mocap_pose_tensor(body_name, rows, values)
 
 
 def test_packed_reset_defaults_fail_closed() -> None:

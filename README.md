@@ -53,6 +53,7 @@ External worker roots can be configured with `UNISIM_ISAACGYM_HOME`, `UNISIM_ISA
 - [Benchmark API reservation](docs/en/benchmark-api.md) — reserved benchmark result schemas
 - [Ray-query plugin contract](docs/en/ray-query.md) — backend-neutral ray caster lifecycle, capabilities, and plugin boundary
 - [Ray tensor lifecycle](docs/en/adr-ray-tensor-lifecycle.md) — caller-owned pose sources, packed/device-resident ray data planes, and stream/output ownership
+- [MJWarp device tensor contract](docs/en/mjwarp-device-contract.md) — batched device reads, site kinematics, reset, force writes, diagnostics, and stream ownership
 - [Release runbook](docs/en/release.md) — TestPyPI checks and automated production publishing
 - [SuperDex CPU profile](docs/en/superdex.md) — experimental adapter and native-asset details
 

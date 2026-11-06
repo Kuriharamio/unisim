@@ -683,9 +683,7 @@ class IsaacGymBackend(MjcfSubprocessBackend):
         if op.body_ids is None:
             raise ValueError("interval body torque requires body_ids")
         zero_force = np.zeros((self._num_envs, len(op.body_ids), 3), dtype=np.float32)
-        self.apply_body_force(
-            op.body_ids, zero_force, torque=interval_payload_to_host(op.payload)
-        )
+        self.apply_body_force(op.body_ids, zero_force, torque=interval_payload_to_host(op.payload))
 
     def apply_body_force(
         self,
@@ -1179,7 +1177,11 @@ class IsaacGymBackend(MjcfSubprocessBackend):
         qpos: Any,
         qvel: Any,
         randomization: Any | None = None,
+        *,
+        mocap_poses: Any | None = None,
     ) -> dict[str, dict[str, float]]:
+        if mocap_poses:
+            raise NotImplementedError("IsaacGym tensor reset does not support mocap poses")
         if randomization is not None and not isinstance(
             randomization, TensorResetRandomizationPayload
         ):
@@ -1208,11 +1210,14 @@ class IsaacGymBackend(MjcfSubprocessBackend):
         randomization: Any | None = None,
         *,
         full_refresh: bool = False,
+        mocap_poses_mask: Any | None = None,
     ) -> dict[str, dict[str, float]] | None:
         """Commit full-width state through a backend-owned mask projection."""
 
         import torch
 
+        if mocap_poses_mask:
+            raise NotImplementedError("IsaacGym tensor mask reset does not support mocap poses")
         if full_refresh:
             raise NotImplementedError("isaacgym CUDA IPC mask reset is a selected-row boundary")
         plan = getattr(self, "_cuda_ipc_plan", None)

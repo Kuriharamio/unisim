@@ -690,6 +690,10 @@ class MuJoCoBackend(SimBackend):
         self._composed_scene = None
         self._host_bridge_plans: weakref.WeakSet[Any] = weakref.WeakSet()
         self._mocap_pose_bindings: dict[str, MocapPoseBinding] = {}
+        self._generic_mocap_pos_shadow: np.ndarray | None = None
+        self._generic_mocap_quat_shadow: np.ndarray | None = None
+        self._generic_mocap_pos_view: Any | None = None
+        self._generic_mocap_quat_view: Any | None = None
         self._entity_layout: CompiledSceneLayout | None = None
         self._entity_faulted = False
         self._entity_closed = False
@@ -1099,9 +1103,7 @@ class MuJoCoBackend(SimBackend):
                 # columns with the same layout as a free joint.
                 q_adr = [int(model.jnt_qposadr[item]) for item in composite]
                 v_adr = [int(model.jnt_dofadr[item]) for item in composite]
-                pose = np.concatenate(
-                    (data.qpos[q_adr[:3]], data.qpos[q_adr[3] : q_adr[3] + 4])
-                )
+                pose = np.concatenate((data.qpos[q_adr[:3]], data.qpos[q_adr[3] : q_adr[3] + 4]))
                 velocity = np.concatenate(
                     (data.qvel[v_adr[:3]], data.qvel[v_adr[3] : v_adr[3] + 3])
                 )
@@ -1722,6 +1724,14 @@ class MuJoCoBackend(SimBackend):
             self._entity_mocap_quat = batch.bind("mocap_quat", dtype)
             self._entity_mocap_pos[:] = self._entity_defaults["mocap_pos"]
             self._entity_mocap_quat[:] = self._entity_defaults["mocap_quat"]
+        elif self._generic_mocap_pos_shadow is not None:
+            assert self._generic_mocap_quat_shadow is not None
+            mocap_pos_view = batch.bind("mocap_pos", dtype)
+            mocap_quat_view = batch.bind("mocap_quat", dtype)
+            self._generic_mocap_pos_view = mocap_pos_view
+            self._generic_mocap_quat_view = mocap_quat_view
+            mocap_pos_view[:] = self._generic_mocap_pos_shadow
+            mocap_quat_view[:] = self._generic_mocap_quat_shadow
         # Staging parity: the wrench and warmstart reach the sim unrounded.
         self._xfrc_view = batch.bind("xfrc_applied")
         self._warm_view = batch.bind("qacc_warmstart")
@@ -2419,7 +2429,77 @@ class MuJoCoBackend(SimBackend):
         self._require_entity_healthy()
         layout = self._entity_layout
         pool = self._pool
-        if layout is None or pool is None:
+        if layout is None:
+            body_id = int(self._compiled_index.body_id(body_name))
+            mocap_id = int(self._model.body_mocapid[body_id])
+            if mocap_id < 0:
+                raise ValueError(f"body {body_name!r} is not a mocap body")
+            if self._generic_mocap_pos_shadow is None:
+                body_ids = np.flatnonzero(np.asarray(self._model.body_mocapid) >= 0)
+                mocap_ids = np.asarray(self._model.body_mocapid[body_ids], dtype=np.int32)
+                body_ids_by_mocap = np.empty(self._model.nmocap, dtype=np.int32)
+                body_ids_by_mocap[mocap_ids] = body_ids
+                self._generic_mocap_pos_shadow = np.broadcast_to(
+                    np.asarray(self._model.body_pos[body_ids_by_mocap], dtype=self._np_dtype),
+                    (self._num_envs, self._model.nmocap, 3),
+                ).copy()
+                self._generic_mocap_quat_shadow = np.broadcast_to(
+                    np.asarray(self._model.body_quat[body_ids_by_mocap], dtype=self._np_dtype),
+                    (self._num_envs, self._model.nmocap, 4),
+                ).copy()
+                if pool is not None:
+                    assert self._generic_mocap_pos_shadow is not None
+                    assert self._generic_mocap_quat_shadow is not None
+                    mocap_pos_view = pool.bind("mocap_pos", self._np_dtype)
+                    mocap_quat_view = pool.bind("mocap_quat", self._np_dtype)
+                    self._generic_mocap_pos_view = mocap_pos_view
+                    self._generic_mocap_quat_view = mocap_quat_view
+                    mocap_pos_view[:] = self._generic_mocap_pos_shadow
+                    mocap_quat_view[:] = self._generic_mocap_quat_shadow
+
+            assert self._generic_mocap_pos_shadow is not None
+            assert self._generic_mocap_quat_shadow is not None
+            default = np.concatenate(
+                (
+                    self._generic_mocap_pos_shadow[0, mocap_id],
+                    self._generic_mocap_quat_shadow[0, mocap_id],
+                )
+            )
+
+            def generic_reader() -> np.ndarray:
+                assert self._generic_mocap_pos_shadow is not None
+                assert self._generic_mocap_quat_shadow is not None
+                return np.concatenate(
+                    (
+                        self._generic_mocap_pos_shadow[:, mocap_id],
+                        self._generic_mocap_quat_shadow[:, mocap_id],
+                    ),
+                    axis=1,
+                )
+
+            def generic_writer(ids: np.ndarray, poses: np.ndarray) -> None:
+                assert self._generic_mocap_pos_shadow is not None
+                assert self._generic_mocap_quat_shadow is not None
+                self._generic_mocap_pos_shadow[ids, mocap_id] = poses[:, :3]
+                self._generic_mocap_quat_shadow[ids, mocap_id] = poses[:, 3:]
+                if self._generic_mocap_pos_view is not None:
+                    assert self._generic_mocap_quat_view is not None
+                    self._generic_mocap_pos_view[ids, mocap_id] = poses[:, :3]
+                    self._generic_mocap_quat_view[ids, mocap_id] = poses[:, 3:]
+                    assert self._pool is not None
+                    self._pool.forward(np.sort(ids))
+
+            binding = MocapPoseBinding(
+                backend_type=self.backend_type,
+                body_name=body_name,
+                num_envs=self._num_envs,
+                default_pose=default,
+                _reader=generic_reader,
+                _writer=generic_writer,
+            )
+            self._mocap_pose_bindings[body_name] = binding
+            return binding
+        if pool is None:
             raise NotImplementedError(
                 "MuJoCo mocap pose binding requires a materialized entity scene"
             )
@@ -2438,7 +2518,7 @@ class MuJoCoBackend(SimBackend):
             )
         )
 
-        def reader() -> np.ndarray:
+        def entity_reader() -> np.ndarray:
             return np.concatenate(
                 (
                     self._entity_mocap_pos[:, mocap_id],
@@ -2447,7 +2527,7 @@ class MuJoCoBackend(SimBackend):
                 axis=1,
             )
 
-        def writer(ids: np.ndarray, poses: np.ndarray) -> None:
+        def entity_writer(ids: np.ndarray, poses: np.ndarray) -> None:
             self._entity_mocap_pos[ids, mocap_id] = poses[:, :3]
             self._entity_mocap_quat[ids, mocap_id] = poses[:, 3:]
             pool.forward(np.sort(ids))
@@ -2458,8 +2538,8 @@ class MuJoCoBackend(SimBackend):
             body_name=body_name,
             num_envs=self._num_envs,
             default_pose=default,
-            _reader=reader,
-            _writer=writer,
+            _reader=entity_reader,
+            _writer=entity_writer,
         )
         self._mocap_pose_bindings[body_name] = binding
         return binding
@@ -2498,6 +2578,68 @@ class MuJoCoBackend(SimBackend):
         if target.type == "cuda":
             torch.cuda.current_stream(target).synchronize()
         return result
+
+    def set_control_targets(self, env_indices: Any, targets: Any) -> None:
+        """Write selected actuator targets and publish them to MuJoCo worlds."""
+        self._require_entity_healthy()
+        rows = np.asarray(env_indices)
+        values = np.asarray(targets)
+        if rows.ndim != 1 or not np.issubdtype(rows.dtype, np.integer):
+            raise TypeError("MuJoCo control rows must be a one-dimensional integer array")
+        rows = rows.astype(np.intp, copy=False)
+        if values.shape != (rows.size, self._model.nu):
+            raise ValueError(
+                f"MuJoCo control targets must have shape {(rows.size, self._model.nu)}"
+            )
+        if not np.isfinite(values).all():
+            raise ValueError("MuJoCo control targets must be finite")
+        if np.any(rows < 0) or np.any(rows >= self._num_envs):
+            raise IndexError("MuJoCo control row is outside the backend batch")
+        if np.unique(rows).size != rows.size:
+            raise ValueError("MuJoCo control rows must be unique")
+        if not rows.size:
+            return
+        pool = self._pool
+        if pool is None:
+            raise RuntimeError("control target writes require a materialized MuJoCo backend")
+        self._ctrl_view[rows] = values.astype(self._np_dtype, copy=False)
+        pool.forward(np.sort(rows))
+
+    def set_joint_generalized_force(self, env_indices: Any, dof_index: int, values: Any) -> None:
+        """Set one public qfrc_applied column for selected MuJoCo worlds."""
+        self._require_entity_healthy()
+        rows = np.asarray(env_indices)
+        force = np.asarray(values, dtype=np.float64)
+        if rows.ndim != 1 or not np.issubdtype(rows.dtype, np.integer):
+            raise TypeError("MuJoCo force rows must be a one-dimensional integer array")
+        rows = rows.astype(np.intp, copy=False)
+        if isinstance(dof_index, bool) or not isinstance(dof_index, (int, np.integer)):
+            raise TypeError("MuJoCo force dof_index must be an integer")
+        dof_index = int(dof_index)
+        if not 0 <= dof_index < self.nv:
+            raise IndexError("MuJoCo force dof_index is outside the qvel layout")
+        if force.ndim == 0:
+            force = np.full(rows.size, float(force), dtype=np.float64)
+        elif force.shape == (rows.size, 1):
+            force = force[:, 0]
+        elif force.shape != (rows.size,):
+            raise ValueError("MuJoCo force values must be scalar or one value per row")
+        if not np.isfinite(force).all():
+            raise ValueError("MuJoCo generalized-force values must be finite")
+        if np.any(rows < 0) or np.any(rows >= self._num_envs):
+            raise IndexError("MuJoCo force row is outside the backend batch")
+        if np.unique(rows).size != rows.size:
+            raise ValueError("MuJoCo force rows must be unique")
+        if not rows.size:
+            return
+        applied = self._entity_qfrc_view
+        if applied is None:
+            if self._pool is None:
+                raise RuntimeError("generalized-force write requires a materialized backend")
+            applied = self._pool.bind("qfrc_applied", np.float64)
+        if applied.ndim != 2 or applied.shape != (self._num_envs, self.nv):
+            raise ValueError("MuJoCo generalized-force buffer has an unsupported layout")
+        applied[rows, dof_index] = force
 
     def get_sensor_view(self, name: str, device: Any | None = None) -> Any:
         """Copy one named CPU sensor block to the selected Torch device."""
@@ -3020,6 +3162,8 @@ class MuJoCoBackend(SimBackend):
         qpos: Any,
         qvel: Any,
         randomization: TensorResetRandomizationPayload | None = None,
+        *,
+        mocap_poses: Mapping[str, tuple[Any, Any]] | None = None,
     ) -> dict | None:
         """Bridge selected accelerator reset state to CPU physics."""
         import torch
@@ -3075,7 +3219,10 @@ class MuJoCoBackend(SimBackend):
         rows = env_indices.detach().cpu().numpy()
         positions = qpos.detach().cpu().numpy()
         velocities = qvel.detach().cpu().numpy()
-        return self._host_set_state(rows, positions, velocities, randomization)
+        result = self._host_set_state(rows, positions, velocities, randomization)
+        if mocap_poses:
+            self.set_mocap_poses_tensor(mocap_poses)
+        return result
 
     def set_state_tensor_mask(
         self,
@@ -3085,6 +3232,7 @@ class MuJoCoBackend(SimBackend):
         randomization: TensorResetRandomizationPayload | None = None,
         *,
         full_refresh: bool = False,
+        mocap_poses_mask: Mapping[str, tuple[Any, Any]] | None = None,
     ) -> dict | None:
         """Commit full-width tensors selected by a backend-owned bool mask."""
         import torch
@@ -3171,6 +3319,8 @@ class MuJoCoBackend(SimBackend):
                 timing["set_state_tensor_model_update_ms"] = timing.get(
                     "set_state_reset_rand_ms", 0.0
                 )
+        if mocap_poses_mask:
+            self.set_mocap_poses_tensor_mask(mocap_poses_mask)
         if full_refresh:
             refresh_started = time.perf_counter()
             pool = self._pool
@@ -3182,6 +3332,31 @@ class MuJoCoBackend(SimBackend):
                 time.perf_counter() - refresh_started
             ) * 1000.0
         return {"timing": timing}
+
+    def set_mocap_poses_tensor_mask(self, poses: Mapping[str, tuple[Any, Any]]) -> None:
+        """Bridge full-width device mocap masks to the CPU MuJoCo executor."""
+        import torch
+
+        if not isinstance(poses, Mapping):
+            raise TypeError("MuJoCo mocap masks must map body names to (mask, poses) pairs")
+        for body_name, values in poses.items():
+            if not isinstance(values, tuple) or len(values) != 2:
+                raise TypeError("MuJoCo mocap mask values must be (mask, poses) pairs")
+            mask, pose_values = values
+            if not isinstance(mask, torch.Tensor) or mask.dtype != torch.bool or mask.ndim != 1:
+                raise TypeError("MuJoCo mocap mask must be a one-dimensional bool tensor")
+            if tuple(mask.shape) != (self._num_envs,):
+                raise ValueError(f"MuJoCo mocap mask must have shape {(self._num_envs,)}")
+            if not isinstance(pose_values, torch.Tensor) or tuple(pose_values.shape) != (
+                self._num_envs,
+                7,
+            ):
+                raise ValueError(f"MuJoCo mocap poses must have shape {(self._num_envs, 7)}")
+            rows = torch.nonzero(mask, as_tuple=False).flatten()
+            if rows.numel():
+                self.set_mocap_pose_tensor(
+                    body_name, rows, pose_values.index_select(0, rows).contiguous()
+                )
 
     def get_dr_capabilities(self) -> DomainRandomizationCapabilities:
         # Device-resident payloads cross to host NumPy at the private boundary.

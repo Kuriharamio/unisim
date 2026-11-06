@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Added the public MJWarp device-read contract for batched frame plans, named site poses and Jacobians, state-conditioned site kinematics, generalized-force writes, device-mask mocap reset, and runtime diagnostics. Packed state and mocap writes now share one device reset commit; the contract documents exact-device and stream-completion ownership.
+- Removed synchronous CUDA scalar reads from packed-reset composition. Deferred finite checks now reach the backend's single reset verdict, while strict mode still reports invalid reset values during commit.
+
 ## 2.2.5 - 2026-10-31
 
 - Fixed Motrix whole-MJCF public `qvel` readback for rotated floating roots. Full and selected state reads now preserve the generalized body-frame angular velocity instead of returning the world-frame body sensor value; world-frame angular sensors remain unchanged. Added a rotated-root mask-reset regression covering host, tensor, and selected-row reads.

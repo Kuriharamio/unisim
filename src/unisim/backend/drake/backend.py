@@ -710,8 +710,7 @@ class DrakeBackend(SimBackend):
         if randomization is not None and not randomization.is_empty():
             requested = ", ".join(sorted(randomization.requested_terms()))
             raise NotImplementedError(
-                "DrakeUni batch backend does not support reset randomization terms: "
-                f"{requested}."
+                f"DrakeUni batch backend does not support reset randomization terms: {requested}."
             )
         indices = np.asarray(env_indices, dtype=np.int32)
         qpos_rows = np.asarray(qpos, dtype=np.float64)
@@ -1092,6 +1091,8 @@ class DrakeBackend(SimBackend):
         qpos: Any,
         qvel: Any,
         randomization: TensorResetRandomizationPayload | None = None,
+        *,
+        mocap_poses: Any | None = None,
     ) -> dict | None:
         """Bridge selected accelerator reset state to CPU Drake physics."""
 
@@ -1099,12 +1100,13 @@ class DrakeBackend(SimBackend):
 
         from .tensor import require_drake_tensor_runtime
 
+        if mocap_poses:
+            raise NotImplementedError("Drake tensor reset does not support mocap poses")
         require_drake_tensor_runtime(self)
         if randomization is not None:
             if not isinstance(randomization, TensorResetRandomizationPayload):
                 raise TypeError(
-                    "Drake tensor reset randomization must be a "
-                    "TensorResetRandomizationPayload"
+                    "Drake tensor reset randomization must be a TensorResetRandomizationPayload"
                 )
             if not randomization.is_empty():
                 requested = ", ".join(sorted(randomization.requested_terms()))

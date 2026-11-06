@@ -2799,9 +2799,7 @@ class NewtonBackend(SimBackend):
         count = torch.zeros((self._num_envs,), dtype=torch.int32, device=device)
         position = torch.zeros((self._num_envs, 3), dtype=torch.float32, device=device)
         force = torch.zeros_like(position)
-        count.index_add_(
-            0, matched_world, torch.ones_like(matched_world, dtype=torch.int32)
-        )
+        count.index_add_(0, matched_world, torch.ones_like(matched_world, dtype=torch.int32))
         position.index_add_(0, matched_world, first_body_position[matched])
         force.index_add_(0, matched_world, force0[matched] * direction[matched])
         position = position / count.clamp_min(1).to(dtype=position.dtype)[:, None]
@@ -3162,9 +3160,13 @@ class NewtonBackend(SimBackend):
         qpos: Any,
         qvel: Any,
         randomization: TensorResetRandomizationPayload | None = None,
+        *,
+        mocap_poses: Any | None = None,
     ) -> dict | None:
         import torch
 
+        if mocap_poses:
+            raise NotImplementedError("newton tensor reset does not support mocap poses")
         self._require_state("tensor reset")
         values = {"env_indices": env_indices, "qpos": qpos, "qvel": qvel}
         for name, value in values.items():
@@ -3235,11 +3237,14 @@ class NewtonBackend(SimBackend):
         randomization: TensorResetRandomizationPayload | None = None,
         *,
         full_refresh: bool = False,
+        mocap_poses_mask: Any | None = None,
     ) -> dict | None:
         """Commit full-width state selected by a backend-owned boolean mask."""
 
         import torch
 
+        if mocap_poses_mask:
+            raise NotImplementedError("newton tensor mask reset does not support mocap poses")
         if full_refresh:
             raise NotImplementedError("newton tensor mask reset is a selected-row boundary")
         self._require_state("tensor mask reset")
