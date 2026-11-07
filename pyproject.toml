@@ -45,6 +45,13 @@ mujoco = [
 motrix = ["motrixsim-core==0.10.1"]
 drake = ["drake-uni==0.1.0"]
 mjwarp = ["mujoco-warp~=3.11.0", "warp-lang==1.16.0"]
+# MuJoCo 3.17 runtime, kept separate from the established 3.11 extras. The
+# executor fork is pinned by commit so source builds use the tested ABI.
+mujoco317 = [
+    "mujoco==3.17.0",
+    "mjbatch-uni @ git+https://github.com/Kuriharamio/mjbatch_uni.git@435324d72e2614a93232f76032f4008d36150cb5",
+]
+mjwarp317 = ["mujoco-warp==3.17.0", "warp-lang==1.19.0"]
 genesis = ["genesis-world==1.3.3"]
 # The superdex-uni wheels are a temporary unilabsim build carrying the native
 # batch executor (CPython 3.12 and 3.13 ABIs) until the upstream
@@ -125,3 +132,17 @@ reportMissingModuleSource = "none"
 # from their sources and reports hundreds of false attribute errors.  NumPy
 # carries py.typed and stays fully checked.
 useLibraryCodeForTypes = false
+
+[tool.uv]
+conflicts = [
+    [{ extra = "mujoco" }, { extra = "mujoco317" }],
+    [{ extra = "mujoco" }, { extra = "mjwarp317" }],
+    [{ extra = "mjwarp" }, { extra = "mujoco317" }],
+    [{ extra = "mjwarp" }, { extra = "mjwarp317" }],
+    [{ extra = "newton" }, { extra = "mujoco317" }],
+    [{ extra = "newton" }, { extra = "mjwarp317" }],
+    [{ extra = "scene-compiler" }, { extra = "mujoco317" }],
+    [{ extra = "scene-compiler" }, { extra = "mjwarp317" }],
+    [{ extra = "superdex" }, { extra = "mujoco317" }],
+    [{ extra = "superdex" }, { extra = "mjwarp317" }],
+]
