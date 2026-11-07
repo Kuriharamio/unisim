@@ -172,7 +172,13 @@ def test_uniform_public_layout_allows_optional_slots_to_change_body_simple(
     tool_body = mujoco.mj_name2id(canonical, mujoco.mjtObj.mjOBJ_BODY, "tool")
     headless_oracle = mujoco.MjModel.from_xml_path(headless)
     assert int(canonical.body_simple[tool_body]) == 0
-    assert int(headless_oracle.body_simple[headless_oracle.body("tool").id]) == 1
+    # MuJoCo 3.17 serializes the explicit inertial and reclassifies this
+    # compiler-only flag; MuJoCo 3.11 preserves the MjSpec classification.
+    expected_headless_simple = 0 if mujoco.__version__.startswith("3.17.") else 1
+    assert (
+        int(headless_oracle.body_simple[headless_oracle.body("tool").id])
+        == expected_headless_simple
+    )
 
 
 def test_same_layout_rejects_different_geom_counts(tmp_path: Path) -> None:

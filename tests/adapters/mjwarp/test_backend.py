@@ -903,9 +903,9 @@ def test_mjwarp_mask_tensor_reset_supports_full_refresh(tmp_path: Path) -> None:
     torch.testing.assert_close(after[~mask], views["qpos"][~mask])
 
 
-def test_mjwarp_mask_tensor_reset_rejects_randomization() -> None:
+def test_mjwarp_mask_tensor_reset_rejects_randomization(tmp_path: Path) -> None:
     torch = pytest.importorskip("torch")
-    backend = _make_backend(Path("/tmp"), "unused-mask-randomization.xml", num_envs=2)
+    backend = _make_backend(tmp_path, "unused-mask-randomization.xml", num_envs=2)
     mask = torch.zeros((2,), dtype=torch.bool, device="cuda")
     qpos = backend.get_state_views(("qpos",))["qpos"].clone()
     qvel = backend.get_state_views(("qvel",))["qvel"].clone()
@@ -919,9 +919,9 @@ def test_mjwarp_mask_tensor_reset_rejects_randomization() -> None:
         )
 
 
-def test_mjwarp_step_publishes_public_completion_receipt() -> None:
+def test_mjwarp_step_publishes_public_completion_receipt(tmp_path: Path) -> None:
     torch = pytest.importorskip("torch")
-    backend = _make_backend(Path("/tmp"), "unused-completion.xml", num_envs=2)
+    backend = _make_backend(tmp_path, "unused-completion.xml", num_envs=2)
     if not backend._cuda_graph_enabled:
         reason = backend._cuda_graph_disable_reason or "unknown reason"
         pytest.skip(f"test requires an mjwarp CUDA graph; graphs disabled: {reason}")
@@ -941,9 +941,9 @@ def test_mjwarp_step_publishes_public_completion_receipt() -> None:
     backend.close()
 
 
-def test_mjwarp_reset_publishes_no_completion_receipt() -> None:
+def test_mjwarp_reset_publishes_no_completion_receipt(tmp_path: Path) -> None:
     torch = pytest.importorskip("torch")
-    backend = _make_backend(Path("/tmp"), "unused-mask-completion.xml", num_envs=2)
+    backend = _make_backend(tmp_path, "unused-mask-completion.xml", num_envs=2)
     if not backend._cuda_graph_enabled:
         reason = backend._cuda_graph_disable_reason or "unknown reason"
         pytest.skip(f"test requires an mjwarp CUDA graph; graphs disabled: {reason}")
@@ -957,9 +957,11 @@ def test_mjwarp_reset_publishes_no_completion_receipt() -> None:
     backend.close()
 
 
-def test_mjwarp_eager_execution_publishes_step_completion_without_physics_graphs() -> None:
+def test_mjwarp_eager_execution_publishes_step_completion_without_physics_graphs(
+    tmp_path: Path,
+) -> None:
     torch = pytest.importorskip("torch")
-    backend = _make_backend(Path("/tmp"), "unused-eager-completion.xml", num_envs=2)
+    backend = _make_backend(tmp_path, "unused-eager-completion.xml", num_envs=2)
     backend._cuda_graph_enabled = False
 
     qpos = backend.get_state_views(("qpos",))["qpos"].clone()
