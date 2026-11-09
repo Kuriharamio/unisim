@@ -504,3 +504,33 @@ def test_mujoco_ray_collision_projection_materializes_mesh_and_hfield(
     assert all(mesh.indices.dtype == np.int32 for mesh in collision.meshes)
     np.testing.assert_array_equal(collision.geom_mesh_ids, [0, 1])
     backend.close()
+
+
+def test_mujoco_ray_collision_uses_face_rows_for_each_mesh(tmp_path: Path) -> None:
+    xml = """<mujoco model='multiple-meshes'>
+      <asset>
+        <mesh name='tetra' vertex='0 0 0 1 0 0 0 1 0 0 0 1'
+              face='0 2 1 0 1 3 0 3 2 1 2 3'/>
+        <mesh name='pyramid' vertex='0 0 0 1 0 0 1 1 0 0 1 0 0.5 0.5 1'
+              face='0 2 1 0 3 2 0 1 4 1 2 4 2 3 4 3 0 4'/>
+      </asset>
+      <worldbody>
+        <body name='first'><geom name='first_mesh' type='mesh' mesh='tetra'/></body>
+        <body name='second'><geom name='second_mesh' type='mesh' mesh='pyramid'/></body>
+      </worldbody>
+    </mujoco>"""
+    model_path = tmp_path / "multiple-meshes.xml"
+    model_path.write_text(xml)
+    backend = MuJoCoBackend(SceneCfg(model_file=str(model_path)), num_envs=1, sim_dt=0.01)
+
+    collision = backend.get_ray_collision_description()
+    assert [mesh.asset_id for mesh in collision.meshes] == [
+        "mujoco:mesh:tetra",
+        "mujoco:mesh:pyramid",
+    ]
+    assert [mesh.indices.size for mesh in collision.meshes] == [12, 18]
+    for mesh in collision.meshes:
+        assert mesh.indices.size % 3 == 0
+        assert mesh.indices.min() >= 0
+        assert mesh.indices.max() < mesh.points.shape[0]
+    backend.close()
