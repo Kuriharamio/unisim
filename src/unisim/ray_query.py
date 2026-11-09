@@ -153,13 +153,16 @@ class RaySceneDescription:
 
 @dataclass(frozen=True)
 class RayMeshDescription:
-    """One detached, deduplicated triangle-mesh asset in geom-local coordinates.
+    """One detached, deduplicated mesh asset in compiled geom-local coordinates.
 
     ``asset_id`` identifies the mesh asset only. A geom instance is identified by
     its index and name in :class:`RayCollisionDescription`; multiple geom
     instances may reference one mesh asset. Identities are stable for the
-    descriptor/materialization lifecycle, not across rebuilds or backends.
-    Triangles must have positive area so face normals and ray hits are defined.
+    descriptor/materialization lifecycle, not across rebuilds or backends. Mesh
+    vertices include backend asset transforms, including asset scale, and are
+    already expressed in the geom-local metric frame. Consumers must not
+    multiply them by ``RaySceneDescription.geom_sizes``. Triangles must have
+    positive area so face normals and ray hits are defined.
     """
 
     asset_id: str

@@ -257,8 +257,10 @@ class TactileSensor(abc.ABC):
     def read(self) -> Mapping[str, Any]:
         """Return the latest observation without changing model state.
 
-        Each returned field is described by ``output_specs``. Sensor-owned
-        buffers remain valid for the lifetime declared by that field.
+        Before the first ``advance``, an explicit ``reset`` establishes a
+        cleared observation that may be read. Each field is described by
+        ``output_specs``. Sensor-owned buffers remain valid for the lifetime
+        declared by that field.
         """
 
     @abc.abstractmethod
@@ -266,7 +268,8 @@ class TactileSensor(abc.ABC):
         """Clear temporal state and output for all or selected environments.
 
         Reset leaves the most recently cached poses unchanged. The next
-        ``advance`` seeds fresh history for the selected environments.
+        ``advance`` seeds fresh history for the selected environments. Before
+        the first ``advance``, reset makes the cleared output readable.
         """
 
     def rebuild(self, scene: TactileSceneDescription) -> None:
