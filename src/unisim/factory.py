@@ -12,6 +12,7 @@ from .contract import BackendError, SimBackend
 from .optional import OptionalDependencyError
 from .ray_query import RayCaster, ray_caster_spec
 from .scene import SceneCfg, require_scene_composition_support
+from .tactile import TactileSensor, tactile_sensor_spec
 from .validation import (
     SemanticRequirements,
     validate_semantic_requirements,
@@ -513,6 +514,69 @@ def create_ray_caster(
             "which is not a unisim.RayCaster"
         )
     return caster
+
+
+def create_tactile_sensor(
+    plugin_type: str,
+    *,
+    model: str,
+    num_envs: int = 1,
+    config: Mapping[str, Any] | None = None,
+    **kwargs: Any,
+) -> TactileSensor:
+    """Construct a tactile model plugin without importing optional runtimes.
+
+    ``plugin_type`` names a separately distributed package (for example,
+    ``"unitac"``); ``model`` selects an algorithm inside that package. The
+    model-specific ``config`` mapping is passed through untouched. Plugins
+    expose ``create_tactile_sensor(model=..., num_envs=..., config=...,
+    **kwargs) -> TactileSensor`` and are imported only when selected.
+    """
+    if not isinstance(plugin_type, str) or not plugin_type:
+        raise ValueError("plugin_type must be a non-empty string")
+    if not isinstance(model, str) or not model:
+        raise ValueError("model must be a non-empty string")
+    if isinstance(num_envs, bool) or not isinstance(num_envs, int):
+        raise TypeError("num_envs must be an integer")
+    if num_envs <= 0:
+        raise ValueError("num_envs must be positive")
+    if config is not None and not isinstance(config, Mapping):
+        raise TypeError("config must be a mapping or None")
+    try:
+        spec = tactile_sensor_spec(plugin_type)
+    except KeyError:
+        raise ValueError(f"unknown UniSim tactile sensor plugin: {plugin_type!r}") from None
+    if spec.status != "available":
+        raise BackendError(f"tactile sensor plugin '{plugin_type}' is not currently available")
+    import importlib
+
+    try:
+        module = importlib.import_module(spec.package)
+    except ImportError as error:
+        raise OptionalDependencyError(
+            f"tactile sensor plugin '{plugin_type}' requires the optional package "
+            f"'{spec.package}', which is not installed; install it to use this sensor"
+        ) from error
+    plugin_factory = getattr(module, "create_tactile_sensor", None)
+    if not callable(plugin_factory):
+        raise OptionalDependencyError(
+            f"tactile sensor package '{spec.package}' does not expose a callable "
+            "create_tactile_sensor entry point; the plugin contract requires "
+            "create_tactile_sensor(model=..., num_envs=..., config=..., **kwargs) "
+            "-> TactileSensor"
+        )
+    sensor = plugin_factory(
+        model=model,
+        num_envs=num_envs,
+        config={} if config is None else config,
+        **kwargs,
+    )
+    if not isinstance(sensor, TactileSensor):
+        raise BackendError(
+            f"tactile sensor plugin '{plugin_type}' factory returned "
+            f"{type(sensor).__name__}, which is not a unisim.TactileSensor"
+        )
+    return sensor
 
 
 def _warn_ignored_mujoco_options(

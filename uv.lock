@@ -3226,7 +3226,7 @@ wheels = [
 
 [[package]]
 name = "unisim-core"
-version = "2.2.5"
+version = "2.3.0"
 source = { editable = "." }
 dependencies = [
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11' or (extra == 'extra-11-unisim-core-mjwarp' and extra == 'extra-11-unisim-core-mjwarp317') or (extra == 'extra-11-unisim-core-mjwarp' and extra == 'extra-11-unisim-core-mujoco317') or (extra == 'extra-11-unisim-core-mjwarp317' and extra == 'extra-11-unisim-core-mujoco') or (extra == 'extra-11-unisim-core-mjwarp317' and extra == 'extra-11-unisim-core-newton') or (extra == 'extra-11-unisim-core-mjwarp317' and extra == 'extra-11-unisim-core-scene-compiler') or (extra == 'extra-11-unisim-core-mjwarp317' and extra == 'extra-11-unisim-core-superdex') or (extra == 'extra-11-unisim-core-mujoco' and extra == 'extra-11-unisim-core-mujoco317') or (extra == 'extra-11-unisim-core-mujoco317' and extra == 'extra-11-unisim-core-newton') or (extra == 'extra-11-unisim-core-mujoco317' and extra == 'extra-11-unisim-core-scene-compiler') or (extra == 'extra-11-unisim-core-mujoco317' and extra == 'extra-11-unisim-core-superdex')" },

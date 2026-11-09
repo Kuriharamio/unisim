@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Added a backend-neutral tactile plugin contract and lazy `create_tactile_sensor` dispatch. The scene reuses public collision geometry and mounted-site frames; output fields declare independent shapes, units, coordinate frames, and buffer lifetimes. UniSim does not import tactile runtimes until a plugin is selected.
 - Added the public MJWarp device-read contract for batched frame plans, named site poses and Jacobians, state-conditioned site kinematics, generalized-force writes, device-mask mocap reset, and runtime diagnostics. Packed state and mocap writes now share one device reset commit; the contract documents exact-device and stream-completion ownership.
 - Removed synchronous CUDA scalar reads from packed-reset composition. Deferred finite checks now reach the backend's single reset verdict, while strict mode still reports invalid reset values during commit.
 

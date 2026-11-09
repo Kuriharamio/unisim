@@ -57,7 +57,7 @@ from .entities import (
     SceneEntitySpec,
     SceneResetRequest,
 )
-from .factory import create_backend, create_ray_caster
+from .factory import create_backend, create_ray_caster, create_tactile_sensor
 from .fake import FakeBackend
 from .fake_ray import FakeRayCaster
 from .inspection import (
@@ -90,6 +90,15 @@ from .ray_query import (
     require_ray_trace_query,
 )
 from .scene_layout import CompiledSceneLayout, EntityLayout, JointLayout
+from .tactile import (
+    TACTILE_SENSOR_SPECS,
+    TactileFieldSpec,
+    TactileSceneDescription,
+    TactileSensor,
+    TactileSensorCapabilities,
+    TactileSensorSpec,
+    tactile_sensor_spec,
+)
 from .validation import (
     SemanticRequirements,
     SemanticValidationError,
@@ -175,6 +184,7 @@ __all__ = [
     "adapter_spec",
     "create_backend",
     "create_ray_caster",
+    "create_tactile_sensor",
     "validate_debug_overlays",
     "validate_torch_device",
     "RAY_CASTER_SPECS",
@@ -198,6 +208,13 @@ __all__ = [
     "ray_caster_spec",
     "require_ray_trace_outputs",
     "require_ray_trace_query",
+    "TACTILE_SENSOR_SPECS",
+    "TactileFieldSpec",
+    "TactileSceneDescription",
+    "TactileSensor",
+    "TactileSensorCapabilities",
+    "TactileSensorSpec",
+    "tactile_sensor_spec",
 ]
 
 
