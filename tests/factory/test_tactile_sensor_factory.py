@@ -13,6 +13,7 @@ import pytest
 import unisim
 from unisim import (
     RayCollisionDescription,
+    RayGeometryState,
     RayGeomType,
     RaySceneDescription,
     RaySiteFrameDescription,
@@ -29,16 +30,17 @@ def _scene() -> TactileSceneDescription:
     scene = RaySceneDescription(
         num_bodies=2,
         body_names=("object", "finger"),
-        geom_types=(RayGeomType.BOX,),
-        geom_sizes=np.array([[0.01, 0.01, 0.01]]),
-        geom_local_pos=np.zeros((1, 3)),
-        geom_local_quat=np.array([[1.0, 0.0, 0.0, 0.0]]),
-        geom_body_ids=np.array([0], dtype=np.intp),
+        geom_types=(RayGeomType.BOX, RayGeomType.BOX),
+        geom_sizes=np.array([[0.01, 0.01, 0.01], [0.01, 0.01, 0.01]]),
+        geom_local_pos=np.zeros((2, 3)),
+        geom_local_quat=np.tile([1.0, 0.0, 0.0, 0.0], (2, 1)),
+        geom_body_ids=np.array([0, 1], dtype=np.intp),
     )
     collision = RayCollisionDescription(
         scene=scene,
-        geom_names=("object_geom",),
-        geom_tags=(("object",),),
+        geom_names=("object_geom", "finger_geom"),
+        geom_tags=(("object",), ("finger",)),
+        geom_mesh_ids=np.full(2, -1, dtype=np.intp),
         body_parent_ids=np.array([-1, -1], dtype=np.intp),
     )
     frame = RaySiteFrameDescription(
@@ -130,6 +132,56 @@ def test_tactile_scene_rejects_unbound_object_and_sensor_frames():
     )
     with pytest.raises(ValueError, match="sensor bodies are absent"):
         TactileSceneDescription(scene.collision, ("object",), (missing,))
+
+
+def test_tactile_scene_selects_collision_geoms_and_carries_aligned_geometry_state():
+    scene = _scene()
+    state = RayGeometryState(
+        num_envs=2,
+        geom_names=scene.collision.geom_names,
+        geom_sizes=np.tile(scene.collision.scene.geom_sizes, (2, 1, 1)),
+        geom_local_pos=np.tile(scene.collision.scene.geom_local_pos, (2, 1, 1)),
+        geom_local_quat=np.tile(scene.collision.scene.geom_local_quat, (2, 1, 1)),
+        geom_enabled=np.ones((2, 2), dtype=np.bool_),
+        geom_mesh_ids=np.tile(scene.collision.geom_mesh_ids, (2, 1)),
+    )
+
+    selected = TactileSceneDescription(
+        scene.collision,
+        ("object",),
+        scene.sensor_frames,
+        object_geom_names=("object_geom",),
+        geometry_state=state,
+    )
+
+    assert selected.object_geom_names == ("object_geom",)
+    assert selected.geometry_state is state
+    assert _scene().object_geom_names is None
+
+
+def test_tactile_scene_rejects_invalid_geom_selection_and_misaligned_geometry_state():
+    scene = _scene()
+    with pytest.raises(ValueError, match="absent from collision geometry"):
+        TactileSceneDescription(
+            scene.collision, ("object",), scene.sensor_frames, object_geom_names=("missing",)
+        )
+    with pytest.raises(ValueError, match="must belong to object_body_names"):
+        TactileSceneDescription(
+            scene.collision, ("object",), scene.sensor_frames, object_geom_names=("finger_geom",)
+        )
+    state = RayGeometryState(
+        num_envs=1,
+        geom_names=("other_geom",),
+        geom_sizes=np.ones((1, 1, 3)),
+        geom_local_pos=np.zeros((1, 1, 3)),
+        geom_local_quat=np.asarray([[[1.0, 0.0, 0.0, 0.0]]]),
+        geom_enabled=np.ones((1, 1), dtype=np.bool_),
+        geom_mesh_ids=np.full((1, 1), -1, dtype=np.int32),
+    )
+    with pytest.raises(ValueError, match="match collision geom_names in order"):
+        TactileSceneDescription(
+            scene.collision, ("object",), scene.sensor_frames, geometry_state=state
+        )
 
 
 def test_tactile_field_spec_preserves_unstructured_shape_metadata():

@@ -6,7 +6,7 @@ UniSim provides a backend-neutral lifecycle for tactile computation. A plugin ow
 
 ## Scene and geometry
 
-`TactileSceneDescription` reuses the public `RayCollisionDescription` for collision geometry and `RaySiteFrameDescription` for each sensor's local mount. It selects perceived objects by body name. Use `SimBackend.get_ray_collision_description(body_names=...)` and `SimBackend.get_ray_site_frames(site_names)` on the cold path to build it. Names and pose arrays are detached from the engine. No solver-specific value such as an SDF, FEM matrix, marker lattice, or image calibration belongs in this description.
+`TactileSceneDescription` reuses the public `RayCollisionDescription` for collision geometry and `RaySiteFrameDescription` for each sensor's local mount. `object_body_names` selects bodies; `object_geom_names` optionally narrows perception to an exact set of collision geoms and defaults to all geoms on those bodies. `geometry_state` can carry the aligned per-environment snapshot from `SimBackend.get_ray_geometry_state()`. Use `SimBackend.get_ray_collision_description(body_names=...)`, `SimBackend.get_ray_geometry_state()`, and `SimBackend.get_ray_site_frames(site_names)` on the cold path to build it. Plugins can reject geometry randomization they cannot represent. A geometry change requires a fresh scene and `rebuild()`; a plugin may reject per-environment topology or geometry differences. Names and arrays are detached from the engine. No solver-specific value such as an SDF, FEM matrix, marker lattice, or image calibration belongs in this description.
 
 ## Lifecycle
 
@@ -32,10 +32,10 @@ sensor.close()
 
 | Operation | Semantics |
 | --- | --- |
-| `materialize(scene)` | Binds static collision geometry and sensor mounts once. Initial body poses are identity. |
+| `materialize(scene)` | Binds collision geometry and sensor mounts once. Cached body poses start at zero translation with identity `wxyz` rotation; callers must synchronize actual poses with `update_pose()` before the first `advance()`. |
 | `update_pose(pos, quat, env_ids=None)` | Replaces cached world poses for the selected rows; accepts `(rows, bodies, 3)` positions and `(rows, bodies, 4)` unit `wxyz` quaternions. It does not advance history. |
 | `advance()` | Computes one observation from the latest cached poses and advances temporal state exactly once. Repeated calls advance repeatedly, even if poses did not change. |
-| `read()` | Returns the latest completed observation without changing state. Reading before the first `advance()` is an implementation error. |
+| `read()` | Returns the latest observation without changing state. Reading after `materialize()` but before `advance()` or `reset()` is an implementation error; `reset()` makes its cleared values readable before the first `advance()`. |
 | `reset(env_ids=None)` | Clears temporal state and observation values for all or selected environments, while retaining the cached poses. |
 | `rebuild(scene)` | Rebinds static geometry only when `supports_geometry_rebuild` is declared. A successful rebuild clears history, invalidates prior output views, and requires a new pose update before `advance()`. |
 | `close()` | Releases resources; it is idempotent. Other operations after close fail. |

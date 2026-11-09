@@ -14,7 +14,7 @@ from typing import Any, Literal
 
 from .entity_state import selected_state_rows
 from .errors import UnsupportedCapabilityError
-from .ray_query import RayCollisionDescription, RaySiteFrameDescription
+from .ray_query import RayCollisionDescription, RayGeometryState, RaySiteFrameDescription
 
 
 @dataclass(frozen=True)
@@ -22,7 +22,9 @@ class TactileSceneDescription:
     """Detached geometry and sensor mounts for one tactile materialization.
 
     ``collision`` reuses UniSim's public collision descriptor. Object identity
-    is selected by body name, while each sensor mount reuses the public
+    is selected by body name, with an optional exact geom-name subset. A
+    ``geometry_state`` carries an optional per-environment geometry snapshot
+    aligned to the collision geom axis. Each sensor mount reuses the public
     site-to-body frame description. No engine model, solver object, device
     pointer, or model-specific configuration crosses this boundary.
     """
@@ -30,6 +32,8 @@ class TactileSceneDescription:
     collision: RayCollisionDescription
     object_body_names: tuple[str, ...]
     sensor_frames: tuple[RaySiteFrameDescription, ...]
+    object_geom_names: tuple[str, ...] | None = None
+    geometry_state: RayGeometryState | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.collision, RayCollisionDescription):
@@ -50,6 +54,51 @@ class TactileSceneDescription:
                 "tactile object bodies are absent from collision geometry: "
                 f"{missing_objects}"
             )
+
+        if self.object_geom_names is None:
+            object_geom_names = None
+        else:
+            if isinstance(self.object_geom_names, (str, bytes)) or not isinstance(
+                self.object_geom_names, Sequence
+            ):
+                raise TypeError("object_geom_names must be a sequence of collision geom names")
+            object_geom_names = tuple(self.object_geom_names)
+            if not object_geom_names:
+                raise ValueError("object_geom_names must not be empty when specified")
+            if any(not isinstance(name, str) or not name for name in object_geom_names):
+                raise TypeError("object_geom_names must contain non-empty strings")
+            if len(set(object_geom_names)) != len(object_geom_names):
+                raise ValueError("object_geom_names must be unique")
+            geom_index = {name: index for index, name in enumerate(self.collision.geom_names)}
+            missing_geoms = tuple(name for name in object_geom_names if name not in geom_index)
+            if missing_geoms:
+                raise ValueError(
+                    "tactile object geoms are absent from collision geometry: "
+                    f"{missing_geoms}"
+                )
+            selected_body_ids = {
+                self.collision.scene.body_names.index(name) for name in object_names
+            }
+            wrong_owner = tuple(
+                name
+                for name in object_geom_names
+                if int(self.collision.scene.geom_body_ids[geom_index[name]])
+                not in selected_body_ids
+            )
+            if wrong_owner:
+                raise ValueError(
+                    "tactile object geoms must belong to object_body_names: "
+                    f"{wrong_owner}"
+                )
+
+        geometry_state = self.geometry_state
+        if geometry_state is not None:
+            if not isinstance(geometry_state, RayGeometryState):
+                raise TypeError("geometry_state must be a RayGeometryState or None")
+            if geometry_state.geom_names != self.collision.geom_names:
+                raise ValueError(
+                    "tactile geometry_state geom_names must match collision geom_names in order"
+                )
 
         if isinstance(self.sensor_frames, (str, bytes)) or not isinstance(
             self.sensor_frames, Sequence
@@ -72,6 +121,7 @@ class TactileSceneDescription:
                 f"{missing_bodies}"
             )
         object.__setattr__(self, "object_body_names", object_names)
+        object.__setattr__(self, "object_geom_names", object_geom_names)
         object.__setattr__(self, "sensor_frames", frames)
 
 
