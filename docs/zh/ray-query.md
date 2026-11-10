@@ -32,11 +32,11 @@ host profile 只接受 NumPy；训练 profile 接受 Torch tensor，但不改变
 
 `RaySceneDescription` 为每个 geom 携带一条 SoA 记录：`geom_types`、`geom_sizes` `(n, 3)`、`geom_local_pos` `(n, 3)`、`geom_local_quat` `(n, 4)`（单位 `wxyz` 四元数）和 `geom_body_ids` `(n,)`，外加显式的 `num_bodies`。`body_names` 是公开 body 轴；MuJoCo family 中的匿名 body 会获得稳定的 `body_<i>` alias。可选 body-name 选择会选取并重排该轴，同时 remap geom body ID；缺失、重复或空名称 fail closed。geom 在其所属 body 的局部坐标系中表达。尺寸遵循 MuJoCo 风格的基元约定：sphere 为 `(radius, 0, 0)`；box 为半尺寸 `(x, y, z)`；cylinder 与 capsule 为 `(radius, half_length, 0)`，轴向为局部 `+z`；ellipsoid 为半轴 `(x, y, z)`；plane 是无限的局部 `z = 0` 平面，法线为 `+z`，忽略其尺寸。所有数组在构造时校验、拷贝并写保护；非法输入 fail closed。
 
-MuJoCo family 后端通过 `SimBackend.get_ray_scene_description(body_names=None)` 提供该投影，并用 `ray_geom_type` 映射 MuJoCo geom code。该调用是冷路径元数据；ray 热路径不会解析 model 或刷新 descriptor。Motrix 投影仅覆盖编译几何与原生 runtime 完全一致的已审计 source；生成式 hfield 地形、附加 fragment、逐行 mesh variant，以及异构 fixed-variant source 会 fail closed，而不是静默遗漏或错误表示 runtime 几何。
+MuJoCo family 后端通过 `SimBackend.get_ray_scene_description(body_names=None)` 提供该投影，并用 `ray_geom_type` 映射 MuJoCo geom code。该调用是冷路径元数据；ray 热路径不会解析 model 或刷新 descriptor。Motrix 使用 source MJCF 提供 geom identity 与位姿，并将有效 mesh asset 替换为引擎编译后的 native convex hull。生成式或 source hfield、附加 fragment、逐行 mesh variant，以及异构 fixed-variant source 会 fail closed，而不是静默遗漏或错误表示 runtime 几何。
 
 companion 只覆盖 collision geometry 与 ray query。Public materialized terrain projection、hfield grid metadata 与 subterrain identity 由 #474 单独跟踪。
 
-本阶段 Motrix collision descriptor 仅支持 primitive：source hfield/mesh geometry fail closed，因为 MotrixSim 的归一化与 native mesh introspection 不同于 detached MuJoCo source 投影。
+Motrix mesh collision descriptor 使用引擎编译后的 convex hull，并将其导出为脱离引擎的三角网格，因此 ray surface 与 Motrix 接触面一致。Height field 仍不支持，并会 fail closed。
 
 `SimBackend.get_ray_collision_description(body_names=None)` 返回 companion `RayCollisionDescription`。它携带 `geom_names`、opaque 且 source-qualified 的 `geom_tags`、去重后的 `RayMeshDescription` asset、`geom_mesh_ids`，以及可选的无环 `body_parent_ids`。Parent ID 描述选中 public body 轴内的 ancestry；被省略的 native ancestor 会成为该轴的 root，因此需要完整 ancestor exclusion 的 caller 应选中相关 ancestor 链。Geom instance identity 是其 public index/name；mesh asset identity 独立于实例，多个 geom 可引用同一个 asset。两者仅在同一个 descriptor/materialization 生命周期内稳定；rebuild 会生成新 descriptor 并使旧 identity 失效。tag 没有 universal vocabulary：MuJoCo-family adapter 当前输出 `mujoco:geom_group:<n>` 作为 opaque、source-qualified tag，caller 通过 public descriptor 选择 tag，而不是使用 native 字段。所有数组均 detached 且写保护；native model、native mesh、Warp array、pointer 与 USD prims 均不跨过边界。
 

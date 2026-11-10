@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Added Motrix source-MJCF site-frame projection for tactile scene setup. Mesh and height-field collision projection remains fail-closed.
+- Added Motrix source-MJCF site-frame projection and native convex-hull collision mesh export for tactile scene setup. Height-field collision projection remains fail-closed.
 - Extended `TactileSceneDescription` with exact collision-geom selection and an optional aligned `RayGeometryState` snapshot. Documented zero/identity initial pose synchronization and reset-before-first-advance reads.
 - Defined compiled mesh vertices as asset-scaled geom-local coordinates so consumers do not apply geom size a second time.
 - Added a backend-neutral tactile plugin contract and lazy `create_tactile_sensor` dispatch. The scene reuses public collision geometry and mounted-site frames; output fields declare independent shapes, units, coordinate frames, and buffer lifetimes. UniSim does not import tactile runtimes until a plugin is selected.

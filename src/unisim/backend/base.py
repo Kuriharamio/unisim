@@ -791,7 +791,8 @@ class TensorIOSpec:
             unknown = set(self.body_fields) - {"pos_w", "quat_w", "lin_vel_w", "ang_vel_w"}
             if unknown:
                 raise ValueError(
-                    f"tensor I/O supports only body fields pos_w and quat_w; got {sorted(unknown)}"
+                    "tensor I/O supports body fields pos_w, quat_w, lin_vel_w, and ang_vel_w; "
+                    f"got {sorted(unknown)}"
                 )
             if len(set(self.body_fields)) != len(self.body_fields):
                 raise ValueError(f"tensor I/O body fields must be unique: {self.body_fields}")

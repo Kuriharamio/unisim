@@ -91,7 +91,6 @@ from ..base import (
     unsupported_debug_overlay_error,
 )
 from ..ray_scene import (
-    ray_collision_from_mujoco_model,
     ray_scene_from_mujoco_model,
     ray_site_frames_from_mujoco_model,
 )
@@ -103,6 +102,7 @@ from .camera import (
     tracking_camera_lookat,
 )
 from .playback import run_motrix_playback
+from .ray_collision import collision_from_motrix_model
 
 logger = logging.getLogger(__name__)
 
@@ -2734,14 +2734,11 @@ class MotrixBackend(SimBackend):
         if not model_file:  # pragma: no cover - Motrix construction records a source path
             raise RuntimeError("Motrix backend did not retain a ray-visible source model")
         model = mujoco.MjModel.from_xml_path(model_file)
-        unsupported = sorted({int(code) for code in model.geom_type if int(code) in (1, 7)})
-        if unsupported:
+        if any(int(code) == 1 for code in model.geom_type):
             raise NotImplementedError(
-                "Motrix ray collision geometry supports primitives only; "
-                f"source geom type codes {unsupported} (hfield/mesh) require "
-                "native introspection or the terrain projection follow-up"
+                "Motrix ray collision geometry does not yet project source height fields"
             )
-        return ray_collision_from_mujoco_model(model, body_names=body_names)
+        return collision_from_motrix_model(self._model, model, body_names=body_names)
 
     def get_ray_site_frames(
         self, site_names: Sequence[str]

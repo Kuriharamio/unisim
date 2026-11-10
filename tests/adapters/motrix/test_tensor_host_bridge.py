@@ -169,11 +169,13 @@ def test_ray_collision_projection_fails_closed_on_source_hfield(
         encoding="utf-8",
     )
     backend._scene_model_file = str(model_path)
-    with pytest.raises(NotImplementedError, match="primitives only"):
+    with pytest.raises(NotImplementedError, match="height fields"):
         backend.get_ray_collision_description()
 
 
-def test_ray_collision_projection_fails_closed_on_source_mesh(tmp_path: Path) -> None:
+def test_ray_collision_projection_uses_compiled_convex_hull_for_source_mesh(
+    tmp_path: Path,
+) -> None:
     model_path = tmp_path / "source-mesh.xml"
     model_path.write_text(
         """<mujoco model='source-mesh'>
@@ -194,8 +196,14 @@ def test_ray_collision_projection_fails_closed_on_source_mesh(tmp_path: Path) ->
     )
     backend = MotrixBackend(SceneCfg(str(model_path)), num_envs=1, sim_dt=0.002)
     try:
-        with pytest.raises(NotImplementedError, match="primitives only"):
-            backend.get_ray_collision_description()
+        collision = backend.get_ray_collision_description()
+        mesh_index = collision.geom_names.index("geom_0")
+        mesh = collision.meshes[int(collision.geom_mesh_ids[mesh_index])]
+        hull = backend._model.low.convex_hulls[0]
+
+        assert mesh.asset_id.startswith("motrix:geom_0:")
+        assert mesh.points.shape == (len(hull.points), 3)
+        assert mesh.indices.size == len(hull.face_vertex_indices)
     finally:
         backend.close()
 
@@ -1176,7 +1184,7 @@ def test_packed_body_pose_request_fails_closed(backend: MotrixBackend) -> None:
     }
     with pytest.raises(ValueError, match="body request must name at least one body field"):
         TensorIOSpec(**{**valid, "body_fields": ()})
-    with pytest.raises(ValueError, match="only body fields pos_w and quat_w"):
-        TensorIOSpec(**{**valid, "body_fields": ("lin_vel_w",)})
+    with pytest.raises(ValueError, match="supports body fields pos_w, quat_w"):
+        TensorIOSpec(**{**valid, "body_fields": ("vel_w",)})
     with pytest.raises(KeyError, match="missing from the tracked namespace"):
         backend.bind_host_bridge_io(TensorIOSpec(**{**valid, "body_names": ("missing",)}))
