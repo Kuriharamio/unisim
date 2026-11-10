@@ -8,6 +8,8 @@ UniSim provides a backend-neutral lifecycle for tactile computation. A plugin ow
 
 `TactileSceneDescription` reuses the public `RayCollisionDescription` for collision geometry and `RaySiteFrameDescription` for each sensor's local mount. `object_body_names` selects bodies; `object_geom_names` optionally narrows perception to an exact set of collision geoms and defaults to all geoms on those bodies. `geometry_state` can carry the aligned per-environment snapshot from `SimBackend.get_ray_geometry_state()`. Use `SimBackend.get_ray_collision_description(body_names=...)`, `SimBackend.get_ray_geometry_state()`, and `SimBackend.get_ray_site_frames(site_names)` on the cold path to build it. Plugins can reject geometry randomization they cannot represent. A geometry change requires a fresh scene and `rebuild()`; a plugin may reject per-environment topology or geometry differences. Names and arrays are detached from the engine. No solver-specific value such as an SDF, FEM matrix, marker lattice, or image calibration belongs in this description.
 
+Motrix projects named site frames from source MJCF scenes without generated terrain, appended fragments, or fixed variants. Its ray collision projection still rejects mesh and height-field geoms. Motrix uses convex-hull mesh collision, so source mesh triangles do not establish the exact runtime contact surface ([MJCF mesh reference](https://motrixsim.readthedocs.io/en/latest/user_guide/getting_started/mjcf_reference.html)).
+
 ## Lifecycle
 
 ```python

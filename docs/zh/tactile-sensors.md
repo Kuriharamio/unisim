@@ -8,6 +8,8 @@ UniSim 提供后端中立的触觉计算生命周期。插件负责自己的模�
 
 `TactileSceneDescription` 复用公共 `RayCollisionDescription` 表示碰撞几何，并复用 `RaySiteFrameDescription` 表示传感器相对安装体的局部位姿。`object_body_names` 选择 body；可选的 `object_geom_names` 将感知范围精确限制到指定碰撞 geom，默认使用这些 body 下的全部 geom。`geometry_state` 可携带与碰撞 geom 顺序对齐的逐环境快照，来源为 `SimBackend.get_ray_geometry_state()`。可在冷路径调用 `SimBackend.get_ray_collision_description(body_names=...)`、`SimBackend.get_ray_geometry_state()` 和 `SimBackend.get_ray_site_frames(site_names)` 构造场景。插件可以拒绝自身无法表示的几何随机化。几何改变后需要构造新场景并调用 `rebuild()`；插件可以拒绝逐环境拓扑或几何差异。名称和数组均脱离引擎所有权。SDF、FEM 矩阵、marker 网格和图像标定等求解器专属数据不属于该描述。
 
+Motrix 可从不含生成地形、追加 fragment 或固定变体的源 MJCF 投影具名 site frame。它的射线碰撞投影仍拒绝 mesh 和 height-field geom。Motrix 使用 mesh 凸包进行碰撞，因此源网格三角面不能证明与运行时接触表面完全一致（[MJCF mesh 参考](https://motrixsim.readthedocs.io/en/latest/user_guide/getting_started/mjcf_reference.html)）。
+
 ## 生命周期
 
 ```python
